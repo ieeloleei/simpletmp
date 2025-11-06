@@ -1,0 +1,197 @@
+% --- 1. 生成二维测试数据 ---
+M = 100; N = 150;
+% 创建一个包含平坦区域、斜坡和锐利边缘的真实信号
+Z_true = zeros(M, N);
+% 左上角斜坡
+[X, Y] = meshgrid(1:N, 1:M);
+Z_true(1:50, 1:75) = (X(1:50, 1:75)/75 + Y(1:50, 1:75)/50);
+% 右下角平坦高地
+Z_true(60:end, 90:end) = 3;
+% 添加斜向边缘
+Z_true(sub2ind([M,N], 1:M, round(linspace(80,85,M)))) = 4;
+
+% 添加高斯白噪声
+noise_level = 0.5;
+Z_hat_noisy = Z_true + noise_level * randn(M, N);
+
+% --- 2. 设置参数并调用2D求解器 ---
+n = 1;           % 使用一阶TV（分段常数）来更好地锐化边缘
+gamma_c = 15.0;  % 水平平滑权重
+gamma_r = 15.0;  % 垂直平滑权重
+beta = 0.5;      % 耦合强度，这个值比较关键
+max_outer_iter = 15; % 外层迭代次数
+
+admm_options = struct('rho', 5.0, 'max_iter', 50);
+
+tic;
+Z_filtered_iterative = iterative_2d_trend_filter(Z_hat_noisy, n, gamma_c, gamma_r, ...
+                                'beta', beta, 'max_iter', max_outer_iter, ...
+                                'admm_opts', admm_options);
+toc;
+
+% --- 3. (对比) 运行原始的分离两步法 ---
+tic;
+Z_temp = zeros(M, N);
+for m = 1:M
+    Z_temp(m, :) = admm_trend_filter(Z_hat_noisy(m, :)', n, gamma_c, admm_options);
+end
+Z_filtered_separated = zeros(M, N);
+for j = 1:N
+    Z_filtered_separated(:, j) = admm_trend_filter(Z_temp(:, j), n, gamma_r, admm_options);
+end
+toc;
+
+
+% --- 4. 可视化对比结果 ---
+figure('Position', [100, 100, 1600, 600]);
+subplot(2, 3, 1); imagesc(Z_true); axis image; colorbar; title('真实信号');
+subplot(2, 3, 2); imagesc(Z_hat_noisy); axis image; colorbar; title('噪声观测');
+subplot(2, 3, 3); imagesc(Z_filtered_separated); axis image; colorbar; title('分离两步法结果');
+subplot(2, 3, 4); imagesc(Z_filtered_iterative); axis image; colorbar; title('迭代耦合结果');
+subplot(2, 3, 5); imagesc(abs(Z_filtered_separated - Z_true)); axis image; colorbar; title('分离法误差');
+subplot(2, 3, 6); imagesc(abs(Z_filtered_iterative - Z_true)); axis image; colorbar; title('迭代法误差');
+colormap('jet');
+
+
+function Z_filtered = iterative_2d_trend_filter(Z_hat, n, gamma_c, gamma_r, varargin)
+% ITERATIVE_2D_TREND_FILTER - 使用交替方向迭代法进行2D趋势滤波
+%
+% 通过交替对行和列进行一维L1趋势滤波，来近似求解各向同性的2D平滑问题。
+% 这种方法能显著减少分离处理带来的伪影。
+%
+% 用法:
+%   Z_filtered = iterative_2d_trend_filter(Z_hat, n, gamma_c, gamma_r)
+%   Z_filtered = iterative_2d_trend_filter(Z_hat, n, gamma_c, gamma_r, 'beta', beta_val, ...)
+%
+% 输入:
+%   Z_hat    - (M x N) 观测到的含噪声2D数据矩阵 (例如深度图)
+%   n        - (标量) 趋势滤波的阶数 (e.g., n=2 -> 分段线性)
+%   gamma_c  - (标量, >0) 列方向 (水平) 的正则化参数
+%   gamma_r  - (标量, >0) 行方向 (垂直) 的正则化参数
+%
+% 可选输入 (键值对):
+%   'beta'     - (标量, >=0) 行列耦合强度参数。值越大，结果越趋向各向同性。(默认: 0.1)
+%   'max_iter' - (整数) 外层交替迭代的最大次数 (默认: 10)
+%   'tol'      - (标量) 外层迭代的收敛容忍度 (默认: 1e-3)
+%   'admm_opts'- (结构体) 传递给底层1D求解器 admm_trend_filter 的参数 (e.g., rho, max_iter)
+%
+% 输出:
+%   Z_filtered - (M x N) 滤波/平滑后的2D数据矩阵
+%
+% 依赖:
+%   admm_trend_filter.m - (我们之前构建的1D求解器)
+%
+% 作者: Felix Heide (基于理论模型构建)
+
+% --- 1. 解析输入参数 ---
+p = inputParser;
+addRequired(p, 'Z_hat', @isnumeric);
+addRequired(p, 'n', @(x) isscalar(x) && x >= 0);
+addRequired(p, 'gamma_c', @(x) isscalar(x) && x > 0);
+addRequired(p, 'gamma_r', @(x) isscalar(x) && x > 0);
+addParameter(p, 'beta', 0.1, @(x) isscalar(x) && x >= 0);
+addParameter(p, 'max_iter', 10, @(x) isscalar(x) && x > 0);
+addParameter(p, 'tol', 1e-3, @(x) isscalar(x) && x > 0);
+addParameter(p, 'admm_opts', struct('rho', 1.0, 'max_iter', 50, 'tol', 1e-4), @isstruct);
+parse(p, Z_hat, n, gamma_c, gamma_r, varargin{:});
+
+beta = p.Results.beta;
+max_iter = p.Results.max_iter;
+tol = p.Results.tol;
+admm_opts_in = p.Results.admm_opts;
+
+% 将结构体转换为cell数组以传递给1D求解器
+admm_opts = [fieldnames(admm_opts_in), struct2cell(admm_opts_in)]';
+
+[M, N] = size(Z_hat);
+
+% --- 2. 初始化 ---
+Z_filtered = Z_hat; % 使用观测值作为热启动
+Z_old = Z_filtered;
+
+fprintf('开始交替方向2D趋势滤波 (beta=%.2f)...\n', beta);
+
+% --- 3. 主迭代循环 ---
+for k = 1:max_iter
+    
+    fprintf('--- 外层迭代 %d ---\n', k);
+    
+    % a. 逐行滤波 (Row Pass / Horizontal Filtering)
+    % ------------------------------------------------
+    fprintf('  正在进行逐行滤波...\n');
+    Z_temp_rows = Z_filtered; % 存储上一步结果以计算耦合项
+    for m = 1:M
+        % 提取当前行的观测数据
+        z_hat_m = Z_hat(m, :)';
+        
+        % 构建耦合项的目标"观测值"
+        % (1+2*beta)z_m = z_hat_m + beta*(z_{m-1} + z_{m+1})
+        % z_m = (z_hat_m + beta*(...)) / (1+2*beta)
+        
+        % 处理边界情况
+        if m == 1
+            neighbors = Z_temp_rows(m+1, :)';
+            num_neighbors = 1;
+        elseif m == M
+            neighbors = Z_temp_rows(m-1, :)';
+            num_neighbors = 1;
+        else
+            neighbors = Z_temp_rows(m-1, :)' + Z_temp_rows(m+1, :)';
+            num_neighbors = 2;
+        end
+        
+        % 构造新的目标观测值 z_hat_prime
+        z_hat_prime = (z_hat_m + beta * neighbors) / (1 + num_neighbors * beta);
+        
+        % 调整gamma以匹配新的数据项权重
+        gamma_prime_c = gamma_c / (1 + num_neighbors * beta);
+        
+        % 调用1D求解器
+        Z_filtered(m, :) = admm_trend_filter(z_hat_prime, n, gamma_prime_c, admm_opts{:});
+    end
+    
+    % b. 逐列滤波 (Column Pass / Vertical Filtering)
+    % ------------------------------------------------
+    fprintf('  正在进行逐列滤波...\n');
+    Z_temp_cols = Z_filtered; % 存储行滤波后的结果
+    for j = 1:N
+        % 提取当前列的观测数据
+        z_hat_j = Z_hat(:, j);
+        
+        % 构建耦合项的目标"观测值"
+        if j == 1
+            neighbors = Z_temp_cols(:, j+1);
+            num_neighbors = 1;
+        elseif j == N
+            neighbors = Z_temp_cols(:, j-1);
+            num_neighbors = 1;
+        else
+            neighbors = Z_temp_cols(:, j-1) + Z_temp_cols(:, j+1);
+            num_neighbors = 2;
+        end
+        
+        z_hat_prime = (z_hat_j + beta * neighbors) / (1 + num_neighbors * beta);
+        gamma_prime_r = gamma_r / (1 + num_neighbors * beta);
+        
+        % 调用1D求解器
+        Z_filtered(:, j) = admm_trend_filter(z_hat_prime, n, gamma_prime_r, admm_opts{:});
+    end
+    
+    % c. 检查收敛
+    % ------------------------------------------------
+    change = norm(Z_filtered - Z_old, 'fro') / norm(Z_old, 'fro');
+    fprintf('  迭代 %d 完成. 相对变化量: %.6f\n', k, change);
+    
+    if change < tol
+        fprintf('在第 %d 次迭代收敛。\n', k);
+        break;
+    end
+    
+    Z_old = Z_filtered;
+end
+
+if k == max_iter
+    fprintf('达到最大迭代次数 %d。\n', max_iter);
+end
+
+end
