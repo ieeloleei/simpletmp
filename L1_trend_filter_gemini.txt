@@ -1,0 +1,158 @@
+function z = admm_trend_filter(z_hat, n, gamma, varargin)
+% ADMM_TREND_FILTER - 使用ADMM算法求解n阶L1趋势滤波问题
+%
+% 解决以下优化问题:
+%   minimize (1/2)||z - z_hat||_2^2 + gamma * ||D_n z||_1
+%
+% 用法:
+%   z = admm_trend_filter(z_hat, n, gamma)
+%   z = admm_trend_filter(z_hat, n, gamma, 'rho', rho_val, 'max_iter', iter, 'tol', tol_val)
+%
+% 输入:
+%   z_hat    - (N x 1) 观测到的含噪声信号向量
+%   n        - (标量) 趋势滤波的阶数 (e.g., n=1 -> 分段常数, n=2 -> 分段线性)
+%   gamma    - (标量, >0) 正则化参数，控制平滑度
+%
+% 可选输入 (键值对):
+%   'rho'      - (标量, >0) ADMM的增广拉格朗日参数 (默认: 1.0)
+%   'max_iter' - (整数) 最大迭代次数 (默认: 200)
+%   'tol'      - (标量) 收敛容忍度 (默认: 1e-4)
+%
+% 输出:
+%   z        - (N x 1) 滤波/平滑后的信号向量
+%
+% 算法:
+%   该函数使用交替方向乘子法 (ADMM) 进行求解。
+%   关键的性能优化在于预先计算和分解z-update步骤中的带状稀疏矩阵。
+%
+% 示例:
+%   N = 200;
+%   z_true = [linspace(0,2,50)'; linspace(2,-1,80)'; -ones(70,1)];
+%   z_hat_noisy = z_true + 0.5 * randn(N, 1);
+%   z_filtered = admm_trend_filter(z_hat_noisy, 2, 10.0);
+%   figure; plot(z_hat_noisy, '.'); hold on; plot(z_true, 'k'); plot(z_filtered, 'r');
+%   legend('Noisy', 'True', 'Filtered');
+%
+% 作者: Felix Heide (基于理论模型构建)
+
+% --- 1. 解析输入参数 ---
+p = inputParser;
+addRequired(p, 'z_hat', @isnumeric);
+addRequired(p, 'n', @(x) isscalar(x) && x >= 0);
+addRequired(p, 'gamma', @(x) isscalar(x) && x > 0);
+addParameter(p, 'rho', 1.0, @(x) isscalar(x) && x > 0);
+addParameter(p, 'max_iter', 200, @(x) isscalar(x) && x > 0);
+addParameter(p, 'tol', 1e-4, @(x) isscalar(x) && x > 0);
+parse(p, z_hat, n, gamma, varargin{:});
+
+rho = p.Results.rho;
+max_iter = p.Results.max_iter;
+tol_abs = p.Results.tol;
+
+% --- 2. 初始化和预计算 ---
+N = length(z_hat);
+z_hat = z_hat(:); % 确保是列向量
+
+% 构建 n 阶差分矩阵 D_n
+% diff(eye(N), n) 是一个构建差分矩阵的简洁技巧
+D = diff(eye(N), n);
+D = sparse(D); % 转换为稀疏矩阵以获得最佳性能
+
+% 初始化 ADMM 变量
+z = z_hat; % 使用观测值作为热启动
+u = zeros(N - n, 1);
+y = zeros(N - n, 1); % 缩放后的对偶变量
+
+% **关键性能优化**: 预计算和分解 z-update 的左侧矩阵
+% (I + rho * D' * D) 是一个对称正定带状矩阵
+LHS = speye(N) + rho * (D' * D);
+% 使用 Cholesky 分解，对于正定矩阵比 LU 分解更快更稳定
+R = chol(LHS);
+R_t = R'; % 预存储转置
+
+fprintf('开始 ADMM L1趋势滤波 (n=%d, gamma=%.2f, rho=%.2f)...\n', n, gamma, rho);
+
+% --- 3. ADMM 主循环 ---
+for k = 1:max_iter
+    
+    % 存储上一次迭代的变量以检查收敛性
+    u_old = u;
+    
+    % a. z-update: 求解一个稀疏线性系统
+    % (I + rho*D'*D) * z = z_hat + rho*D'*(u - y)
+    RHS = z_hat + rho * D' * (u - y);
+    % 利用预分解的 Cholesky 因子进行高效求解
+    % 等价于 z = LHS \ RHS; 但速度快得多
+    z = R \ (R_t \ RHS);
+    
+    % b. u-update: 软阈值操作
+    Dz_plus_y = D * z + y;
+    threshold = gamma / rho;
+    u = max(0, Dz_plus_y - threshold) - max(0, -Dz_plus_y - threshold);
+    
+    % c. y-update: 更新对偶变量
+    y = y + (D * z - u);
+    
+    % d. 检查收敛条件
+    r_prim = norm(D * z - u); % 原始残差
+    r_dual = norm(rho * D' * (u - u_old)); % 对偶残差
+    
+    if mod(k, 20) == 0 % 每20次迭代打印一次进度
+        fprintf('Iter %d: Primal Res = %.4f, Dual Res = %.4f\n', k, r_prim, r_dual);
+    end
+    
+    if r_prim < tol_abs && r_dual < tol_abs
+        fprintf('在第 %d 次迭代收敛。\n', k);
+        break;
+    end
+end
+
+if k == max_iter
+    fprintf('达到最大迭代次数 %d。\n', max_iter);
+end
+
+end
+
+
+---
+
+% --- 1. 生成测试数据 ---
+N = 500; % 信号长度
+% 创建一个分段线性的真实信号
+z_true = [linspace(0, 2, 100)'; ...
+          linspace(2, -3, 250)'; ...
+          linspace(-3, -1, 150)'];
+      
+% 添加高斯白噪声
+noise_level = 0.8;
+z_hat_noisy = z_true + noise_level * randn(N, 1);
+
+% --- 2. 设置参数并调用求解器 ---
+n = 2;           % 我们知道信号是分段线性的，所以用二阶差分
+gamma = 50.0;    % 正则化参数，需要根据噪声水平调整。值越大越平滑。
+rho = 10.0;      % ADMM参数，通常影响收敛速度
+
+% 调用我们构建的求解器
+tic; % 计时开始
+z_filtered = admm_trend_filter(z_hat_noisy, n, gamma, 'rho', rho, 'max_iter', 300);
+toc; % 计时结束
+
+% --- 3. 可视化结果 ---
+figure('Name', 'ADMM L1 Trend Filtering Results', 'NumberTitle', 'off');
+set(gcf, 'color', 'w');
+
+% 绘制原始信号和噪声信号
+plot(z_hat_noisy, '.', 'Color', [0.7 0.7 0.9], 'DisplayName', 'Noisy Observation');
+hold on;
+plot(z_true, 'k-', 'LineWidth', 2.5, 'DisplayName', 'True Signal');
+
+% 绘制滤波后的结果
+plot(z_filtered, 'r-', 'LineWidth', 2, 'DisplayName', 'Filtered Signal (z*)');
+
+% 美化图形
+grid on;
+legend('show', 'Location', 'best');
+title(sprintf('%d-阶 L1 趋势滤波 (\\gamma = %.1f)', n, gamma));
+xlabel('样本索引');
+ylabel('幅值');
+hold off;
