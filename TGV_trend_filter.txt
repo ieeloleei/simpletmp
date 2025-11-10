@@ -34,124 +34,118 @@ legend('show', 'Location', 'best');
 title(sprintf('TGV Filter (\\alpha_0=%.1f, \\alpha_1=%.1f)', alpha0, alpha1));
 grid on;
 
-function z = admm_tgv_filter_v2(z_hat, alpha0, alpha1, varargin)
-% ADMM_TGV_FILTER_V2 - (最终修正版) 使用ADMM算法求解二阶TGV趋势滤波问题
+function z = admm_tgv_filter_v3(z_hat, alpha0, alpha1, varargin)
+% ADMM_TGV_FILTER_V3 - (最终生产版) 求解二阶TGV趋势滤波问题
 %
-% 解决了V1版本中因共享rho参数导致的数值不稳定和去噪效果差的问题。
-% 修正了V2草稿版本中的维度不匹配错误。
+% 修正了V2版本中线性系统构建的致命符号错误。
+% 增加了自适应rho机制以提高收敛速度和鲁棒性。
 %
 % 用法:
-%   z = admm_tgv_filter_v2(z_hat, alpha0, alpha1, 'rho1', val1, 'rho2', val2, ...)
-%
-% 输入:
-%   z_hat    - (N x 1) 观测到的含噪声信号向量
-%   alpha0   - (标量, >0) 控制二阶稀疏性的正则化参数 (鼓励w分段常数)
-%   alpha1   - (标量, >0) 控制一阶稀疏性的正则化参数 (鼓励D1z贴近w)
-%
-% 可选输入 (键值对):
-%   'rho1'     - (标量, >0) 对应约束 D1*z - w 的ADMM参数 (默认: alpha1*2)
-%   'rho2'     - (标量, >0) 对应约束 D1*w 的ADMM参数 (默认: alpha0/10)
-%   'max_iter' - (整数) 最大迭代次数 (默认: 500)
-%   'tol'      - (标量) 收敛容忍度 (默认: 1e-5)
-%   'verbose'  - (逻辑值) 是否打印迭代信息 (默认: true)
-%
-% 输出:
-%   z        - (N x 1) TGV滤波后的信号向量
+%   z = admm_tgv_filter_v3(z_hat, alpha0, alpha1, 'rho_init', val, ...)
 
 % --- 1. 解析输入参数 ---
 p = inputParser;
 addRequired(p, 'z_hat', @isnumeric);
 addRequired(p, 'alpha0', @(x) isscalar(x) && x > 0);
 addRequired(p, 'alpha1', @(x) isscalar(x) && x > 0);
-addParameter(p, 'rho1', alpha1*2, @(x) isscalar(x) && x > 0);
-addParameter(p, 'rho2', alpha0/10, @(x) isscalar(x) && x > 0);
+addParameter(p, 'rho_init', (alpha0+alpha1)/2, @(x) isscalar(x) && x > 0);
 addParameter(p, 'max_iter', 500, @(x) isscalar(x) && x > 0);
 addParameter(p, 'tol', 1e-5, @(x) isscalar(x) && x > 0);
 addParameter(p, 'verbose', true, @islogical);
 parse(p, z_hat, alpha0, alpha1, varargin{:});
 
-rho1 = p.Results.rho1;
-rho2 = p.Results.rho2;
+rho = p.Results.rho_init;
 max_iter = p.Results.max_iter;
 tol_abs = p.Results.tol;
 verbose = p.Results.verbose;
+
+% ADMM自适应参数
+mu = 10;
+tau = 2;
 
 % --- 2. 初始化和预计算 ---
 N = length(z_hat);
 z_hat = z_hat(:);
 
-% 构建一阶差分矩阵
-D1z = sparse(diff(eye(N), 1));     % 作用于 z, (N-1)xN
-D1w = sparse(diff(eye(N-1), 1));   % 作用于 w, (N-2)x(N-1)
+D1z = sparse(diff(eye(N), 1));
+D1w = sparse(diff(eye(N-1), 1));
 
-% 初始化 ADMM 变量
 z = z_hat;
 w = zeros(N - 1, 1);
 u1 = zeros(N - 1, 1);
 u2 = zeros(N - 2, 1);
-y1 = zeros(N - 1, 1); % 对偶变量 for D1z-w=u1
-y2 = zeros(N - 2, 1); % 对偶变量 for D1w=u2
+y1 = zeros(N - 1, 1);
+y2 = zeros(N - 2, 1);
 
-% 构建 (z,w)-update 的左侧块矩阵
-A11 = speye(N) + rho1 * (D1z' * D1z);
-A12 = -rho1 * D1z';
-A21 = -rho1 * D1z;
-A22 = rho1 * speye(N-1) + rho2 * (D1w' * D1w);
-
-LHS = [A11, A12; A21, A22];
-% 预分解以加速
-try
-    R = chol(LHS);
-    p_chol = 0;
-catch
-    p_chol = 1;
-end
-
-if p_chol > 0
-    if verbose, warning('Cholesky分解失败，矩阵可能非正定或病态。切换到LU分解。'); end
-    [L_lu, U_lu, P_lu, Q_lu] = lu(LHS);
-end
-if p_chol == 0, R_t = R'; end
-
-if verbose, fprintf('开始 ADMM TGV滤波 (最终修正版 v2)...\n'); end
+if verbose, fprintf('开始 ADMM TGV滤波 (最终生产版 v3)...\n'); end
 
 % --- 3. ADMM 主循环 ---
 for k = 1:max_iter
     z_old = z;
+    u1_old = u1;
+    u2_old = u2;
     
     % a. (z, w)-update
-    RHS_z = z_hat + rho1 * D1z' * (u1 - y1);
-    RHS_w = rho1 * (u1 - y1) + rho2 * D1w' * (u2 - y2);
+    % 每次循环都需要重新构建和分解LHS，因为rho是变化的
+    A11 = speye(N) + rho * (D1z' * D1z);
+    A12 = -rho * D1z';
+    A21 = -rho * D1z;
+    A22 = rho * speye(N-1) + rho * (D1w' * D1w);
+    LHS = [A11, A12; A21, A22];
+    
+    RHS_z = z_hat + rho * D1z' * (u1 - y1);
+    %%% *** CRITICAL FIX HERE: Sign change from '+' to '-' *** %%%
+    RHS_w = rho * (u1 - y1) - rho * D1w' * (u2 - y2);
     RHS = [RHS_z; RHS_w];
     
-    if p_chol == 0
-        zw = R \ (R_t \ RHS); % Cholesky求解
-    else
-        zw = Q_lu * (U_lu \ (L_lu \ (P_lu * RHS))); % LU求解
+    % 使用Cholesky分解求解
+    try
+        R = chol(LHS);
+        zw = R \ (R' \ RHS);
+    catch
+        if verbose, warning('Iter %d: Cholesky failed, using LU.', k); end
+        [L_lu, U_lu, P_lu, Q_lu] = lu(LHS);
+        zw = Q_lu * (U_lu \ (L_lu \ (P_lu * RHS)));
     end
     
     z = zw(1:N);
     w = zw(N+1:end);
     
-    % b. u1-update
+    % b. u-updates (soft thresholding)
     D1z_val = D1z * z;
-    u1 = soft_threshold(D1z_val - w + y1, alpha1 / rho1);
+    u1 = soft_threshold(D1z_val - w + y1, alpha1 / rho);
     
-    % c. u2-update
     D1w_val = D1w * w;
-    u2 = soft_threshold(D1w_val + y2, alpha0 / rho2);
+    u2 = soft_threshold(D1w_val + y2, alpha0 / rho);
     
-    % d. 对偶变量更新
+    % c. y-updates (dual variables)
     y1 = y1 + (D1z_val - w - u1);
-    y2 = y2 + (D1w_val - u2); % <<--- *** 最终修正 ***
+    y2 = y2 + (D1w_val - u2);
     
-    % e. 检查收敛
-    change = norm(z - z_old, 'fro') / (norm(z_old, 'fro') + 1e-12);
-    if verbose && (mod(k, 50) == 0 || k == 1)
-        fprintf('Iter %d: Relative change = %.4e\n', k, change);
+    % d. 计算残差
+    r_prim1 = norm(D1z_val - w - u1);
+    r_prim2 = norm(D1w_val - u2);
+    r_dual1 = norm(rho * D1z' * (u1 - u1_old));
+    r_dual2 = norm(rho * (-(u1-u1_old) + D1w'*(u2-u2_old)));
+    
+    r_prim = sqrt(r_prim1^2 + r_prim2^2);
+    r_dual = sqrt(r_dual1^2 + r_dual2^2);
+
+    % e. 自适应 Rho 更新
+    if r_prim > mu * r_dual
+        rho = rho * tau;
+    elseif r_dual > mu * r_prim
+        rho = rho / tau;
     end
     
-    if change < tol_abs && k > 1
+    % f. 检查收敛
+    change = norm(z - z_old, 'fro') / (norm(z_old, 'fro') + 1e-12);
+    if verbose && (mod(k, 50) == 0 || k == 1)
+        fprintf('Iter %d: RelChg=%.2e, R_prim=%.2e, R_dual=%.2e, rho=%.2f\n', ...
+            k, change, r_prim, r_dual, rho);
+    end
+    
+    if change < tol_abs && k > 50 % 避免过早收敛
         if verbose, fprintf('在第 %d 次迭代收敛。\n', k); end
         break;
     end
