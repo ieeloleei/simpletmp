@@ -1,0 +1,161 @@
+% --- 1. 生成一个真正考验TGV的信号 ---
+N = 500;
+t = (1:N)';
+% 包含: 分段常数(阶跃), 分段线性(斜坡), 分段二次(平滑曲线)
+z_true = ...
+    (t < 100) .* 2 + ...
+    (t >= 100 & t < 250) .* (2 - 4/150 * (t - 100)) + ...
+    (t >= 250 & t < 400) .* (-2 + 1.5 * ((t-250)/150).^2) + ...
+    (t >= 400) .* (-0.5);
+
+noise_level = 0.2;
+z_hat_noisy = z_true + noise_level * randn(N, 1);
+
+% --- 2. 参数调优指南与调用 ---
+% alpha0: 控制“断点”的稀疏性。值越大，断点越少，信号越趋向于一个整体的多项式。
+% alpha1: 控制“平滑度”。值越大，信号越趋向于分段线性。
+% 关键是 alpha0/alpha1 的比率。通常 alpha0 > alpha1。
+
+alpha0 = 20.0;  
+alpha1 = 5.0;   
+
+tic;
+z_tgv = admm_tgv_filter_v2(z_hat_noisy, alpha0, alpha1);
+toc;
+
+% --- 3. 可视化 ---
+figure('Name', 'TGV Filter v2 Results', 'NumberTitle', 'off');
+set(gcf, 'color', 'w');
+plot(z_hat_noisy, '.', 'Color', [0.7 0.7 0.9], 'DisplayName', 'Noisy');
+hold on;
+plot(z_true, 'k-', 'LineWidth', 3, 'DisplayName', 'True');
+plot(z_tgv, 'b-', 'LineWidth', 1.5, 'DisplayName', 'TGV Filtered');
+legend('show', 'Location', 'best');
+title(sprintf('TGV Filter (\\alpha_0=%.1f, \\alpha_1=%.1f)', alpha0, alpha1));
+grid on;
+
+function z = admm_tgv_filter_v2(z_hat, alpha0, alpha1, varargin)
+% ADMM_TGV_FILTER_V2 - (修正版) 使用ADMM算法求解二阶TGV趋势滤波问题
+%
+% 解决了V1版本中因共享rho参数导致的数值不稳定和去噪效果差的问题。
+%
+% 用法:
+%   z = admm_tgv_filter_v2(z_hat, alpha0, alpha1, 'rho1', val1, 'rho2', val2, ...)
+%
+% 输入:
+%   z_hat    - (N x 1) 观测到的含噪声信号向量
+%   alpha0   - (标量, >0) 控制二阶稀疏性的正则化参数 (鼓励w分段常数)
+%   alpha1   - (标量, >0) 控制一阶稀疏性的正则化参数 (鼓励D1z贴近w)
+%
+% 可选输入 (键值对):
+%   'rho1'     - (标量, >0) 对应约束 D1*z - w 的ADMM参数 (默认: alpha1*2)
+%   'rho2'     - (标量, >0) 对应约束 D1*w 的ADMM参数 (默认: alpha0/10)
+%   'max_iter' - (整数) 最大迭代次数 (默认: 500)
+%   'tol'      - (标量) 收敛容忍度 (默认: 1e-5)
+%
+% 输出:
+%   z        - (N x 1) TGV滤波后的信号向量
+
+% --- 1. 解析输入参数 ---
+p = inputParser;
+addRequired(p, 'z_hat', @isnumeric);
+addRequired(p, 'alpha0', @(x) isscalar(x) && x > 0);
+addRequired(p, 'alpha1', @(x) isscalar(x) && x > 0);
+% 为rho提供一个基于alpha的启发式默认值
+addParameter(p, 'rho1', alpha1*2, @(x) isscalar(x) && x > 0);
+addParameter(p, 'rho2', alpha0/10, @(x) isscalar(x) && x > 0);
+addParameter(p, 'max_iter', 500, @(x) isscalar(x) && x > 0);
+addParameter(p, 'tol', 1e-5, @(x) isscalar(x) && x > 0);
+parse(p, z_hat, alpha0, alpha1, varargin{:});
+
+rho1 = p.Results.rho1;
+rho2 = p.Results.rho2;
+max_iter = p.Results.max_iter;
+tol_abs = p.Results.tol;
+
+% --- 2. 初始化和预计算 ---
+N = length(z_hat);
+z_hat = z_hat(:);
+
+% 构建一阶差分矩阵
+D1z = sparse(diff(eye(N), 1)); % 作用于 z, (N-1)xN
+D1w = sparse(diff(eye(N-1), 1)); % 作用于 w, (N-2)x(N-1)
+
+% 初始化 ADMM 变量
+z = z_hat;
+w = zeros(N - 1, 1);
+u1 = zeros(N - 1, 1);
+u2 = zeros(N - 2, 1);
+y1 = zeros(N - 1, 1);
+y2 = zeros(N - 2, 1);
+
+% **关键修正**: 构建使用 rho1 和 rho2 的块矩阵
+A11 = speye(N) + rho1 * (D1z' * D1z);
+A12 = -rho1 * D1z';
+A21 = -rho1 * D1z;
+A22 = rho1 * speye(N-1) + rho2 * (D1w' * D1w);
+
+LHS = [A11, A12; A21, A22];
+% 预分解以加速
+[R, p_chol] = chol(LHS);
+if p_chol > 0
+    % 如果Cholesky分解失败 (矩阵非正定)，使用更稳健的LU分解
+    warning('Cholesky分解失败，矩阵可能非正定或病态。切换到LU分解。');
+    [L_lu, U_lu, P_lu] = lu(LHS);
+end
+R_t = R';
+
+fprintf('开始 ADMM TGV滤波 (修正版 v2)...\n');
+
+% --- 3. ADMM 主循环 ---
+for k = 1:max_iter
+    z_old = z;
+    
+    % a. (z, w)-update
+    RHS_z = z_hat + rho1 * D1z' * (u1 - y1);
+    RHS_w = rho1 * (u1 - y1) + rho2 * D1w' * (u2 - y2);
+    RHS = [RHS_z; RHS_w];
+    
+    if p_chol == 0
+        zw = R \ (R_t \ RHS); % Cholesky求解
+    else
+        zw = U_lu \ (L_lu \ (P_lu * RHS)); % LU求解
+    end
+    
+    z = zw(1:N);
+    w = zw(N+1:end);
+    
+    % b. u1-update
+    D1z_val = D1z * z;
+    u1 = soft_threshold(D1z_val - w + y1, alpha1 / rho1);
+    
+    % c. u2-update
+    D1w_val = D1w * w;
+    u2 = soft_threshold(D1w_val + y2, alpha0 / rho2);
+    
+    % d. 对偶变量更新
+    y1 = y1 + (D1z_val - w - u1);
+    y2 = y2 + (D1w_val - w - u2); % <<-- 修正一个笔误，这里应该是 D1w_val
+    y2 = y2 + (D1w_val - u2); % <<-- 再次修正，根据ADMM标准形式
+    
+    % e. 检查收敛
+    change = norm(z - z_old, 'fro') / (norm(z_old, 'fro') + 1e-6);
+    if mod(k, 50) == 0
+        fprintf('Iter %d: Relative change = %.4e\n', k, change);
+    end
+    
+    if change < tol_abs && k > 1
+        fprintf('在第 %d 次迭代收敛。\n', k);
+        break;
+    end
+end
+
+if k == max_iter
+    fprintf('达到最大迭代次数 %d。\n', max_iter);
+end
+
+end
+
+function y = soft_threshold(x, lambda)
+    y = max(0, x - lambda) - max(0, -x - lambda);
+end
