@@ -1,0 +1,239 @@
+% =========================================================================
+%               修改后的 newton_opt_core_serial 函数
+% =========================================================================
+% 作用: 这是牛顿法求解器的核心，但其内部循环是串行的。
+%      它将被外层的 parfor 调用，以处理一个数据块。
+% =========================================================================
+function [x,it] = newton_opt_core_serial(func, gpu, x0, optTol, stepTol, progTol, maxIter, verbose)
+
+    x = x0;
+    t = 0;
+    maxStepIters = ceil( log2(1/stepTol) );
+    terminated = zeros(1,size(x0,2));
+    for it = 1:maxIter
+        
+        % Sample function
+        if ~gpu
+            [f,g,H] = func(x);
+        else
+            [fs,gs,Hs] = func(gpuArray(x));
+            f = gather(fs);
+            g = gather(gs);
+            H = gather(Hs);
+        end
+        if strcmp(verbose, 'iter')
+            % 为避免在 parfor 中打印过多信息，可以注释掉此行
+            % fprintf('Iteration [%3d] Step [%g] Func --> %g \n', it, mean(t(:)), sum(f(:)) );
+        end
+        terminated = terminated | (sqrt(sum(g.^2,1)) < optTol);
+        if all( terminated ) 
+            break;
+        end
+
+        % Take Newton step if Hessian is pd,
+        % otherwise take a step with negative curvature
+        d = zeros(2,size(g,2));
+        gtd = zeros(size(g,2),1);
+        
+        % --- 修改核心 ---
+        % 中文注释: 将原始的 parfor 修改为 for 循环。
+        %           每个 worker 将串行处理分配给它的像素子集。
+        %           MATLAB 的 JIT (Just-In-Time) 编译器会高效地执行这个循环。
+        for j = 1:size(g,2)
+
+            if any(isnan(reshape(H(:,:,j),[],1))) || any(isinf(reshape(H(:,:,j),[],1)))
+                d(:,j) = 0;
+                gtd(j) = 0;
+            else
+                
+                [R,posDef] = chol(H(:,:,j));
+                if posDef == 0
+                    d(:,j) = -R\(R'\g(:,j));
+                else
+                    [V,D] = eig((H(:,:,j)+H(:,:,j)')/2);
+                    D = diag(D);
+                    D = max(abs(D),max(max(abs(D)),1)*1e-12);
+                    d(:,j) = -V*((V'*g(:,j))./D);
+                end
+                
+                % Directional Derivative
+                gtd(j) = g(:,j)'*d(:,j);     
+            end
+        end
+        % --- 修改结束 ---
+        
+        % Check that progress can be made along direction
+        terminated = terminated | gtd' > -progTol;
+        if all(terminated)
+            break;
+        end
+
+        %Backtrack
+        t = ones(1,size(g,2));
+        t(terminated) = 0;
+        tr = 0.5;
+        for i = 1:maxStepIters
+            x_new =  x + repmat(t,[2,1]) .* d;
+            invalid_idx = ( ~isreal(x_new(1,:)) | (x_new(1,:) < 0) | ~isreal(x_new(2,:)) | (x_new(2,:) < 0) ) & ~terminated;
+            if any(invalid_idx(:))
+                t(invalid_idx) = t(invalid_idx) * tr;
+                continue;
+            end  
+            
+            %Function query
+            if ~gpu
+                fn = func(x_new);
+            else
+                fns = func(gpuArray(x_new));
+                fn = gather(fns);
+            end
+            invalid_idx = ( (imag(fn) ~=0) | (fn > f) ) & ~terminated;
+            if any(invalid_idx(:))
+                t(invalid_idx) = t(invalid_idx) * tr;
+            else
+                break;
+            end            
+        end  
+        
+        %No progress if still invalid
+        if i == maxStepIters
+            t(invalid_idx) = 0;
+            x_new =  x + repmat(t,[2,1]) .* d;
+            if ~gpu
+                fn = func(x_new);
+            else
+                fns = func(gpuArray(x_new));
+                fn = gather(fns);
+            end
+            invalid_idx = ( (imag(fn) ~=0) | (fn > f) ) & ~terminated;
+            t(invalid_idx) = 0;
+        end
+        
+        %Do step
+        terminated = terminated | t < stepTol;
+        if all(terminated)
+            break;
+        end
+        x(:,~terminated) = x(:,~terminated) + repmat(t(1,~terminated),[2,1]) .* d(:,~terminated);    
+
+    end
+    if strcmp(verbose, 'final') && ~isempty(f)
+         fprintf('Final [%3d] Step [%g] Func --> %g \n', it, mean(t), sum(f));
+    end
+
+return;
+
+
+
+% =========================================================================
+%               修改后的 solve_data_prox 函数
+% =========================================================================
+% 作用: 实现数据项的近端算子求解。
+%      此版本通过将像素分块，并使用 parfor 对块进行并行处理来加速计算。
+% =========================================================================
+function [rprox] = solve_data_prox(lambda_residual, tau, v, mask, vv, warmstart, ...
+                                    h, N, xt, gm, QE, I, amb, DC, scz, gpu )
+
+    % Reshape and identify active pixels
+    vz = reshape( v(:,:,1), 1, []);
+    va = reshape( v(:,:,2), 1, []);
+    
+    active_indices = find(mask);
+    N_active = length(active_indices);
+    
+    if N_active == 0
+        rprox = v; % 如果没有有效像素，直接返回
+        return;
+    end
+
+    % --- 修改核心: 数据分块与并行调度 ---
+    % 中文注释: 获取当前并行池的 worker 数量。
+    pool = gcp('nocreate');
+    if isempty(pool)
+        num_workers = 1;
+    else
+        num_workers = pool.NumWorkers;
+    end
+    
+    % 中文注释: 计算每个 worker 需要处理的像素数量，并创建分块索引。
+    chunk_size = ceil(N_active / num_workers);
+    chunks = cell(num_workers, 1);
+    for i = 1:num_workers
+        start_idx = (i-1) * chunk_size + 1;
+        end_idx = min(i * chunk_size, N_active);
+        if start_idx > N_active
+            chunks{i} = [];
+        else
+            chunks{i} = active_indices(start_idx:end_idx);
+        end
+    end
+    
+    % 中文注释: 准备一个 cell 数组来存储每个块的计算结果。
+    results_cell = cell(num_workers, 1);
+    
+    % 中文注释: 使用 parfor 循环并行处理每个数据块。
+    parfor i = 1:num_workers
+        
+        pixel_indices = chunks{i};
+        if isempty(pixel_indices)
+            continue; % 如果块为空，则跳过
+        end
+        
+        % 提取当前块的数据
+        h_chunk = h(:, pixel_indices);
+        vz_chunk = vz(:, pixel_indices);
+        va_chunk = va(:, pixel_indices);
+        
+        % 提取当前块的初始值
+        if warmstart == 1
+            vvz = reshape( vv(:,:,1), 1, []);
+            vva = reshape( vv(:,:,2), 1, []);
+            x0_chunk = cat(1, vvz(:,pixel_indices), vva(:,pixel_indices));
+        else
+            x0_chunk = cat(1, vz_chunk, va_chunk);
+        end
+        
+        % 为当前块定义目标函数
+        if ~gpu
+            objGrad_f_chunk = @(xn) obj_grad_func( xn(1,:), xn(2,:), scz, h_chunk, N, xt, gm, QE, I, amb, DC, lambda_residual, tau, vz_chunk, va_chunk );
+        else
+            objGrad_f_chunk = @(xn) obj_grad_func( xn(1,:), xn(2,:), scz, ...
+                                               gpuArray(h_chunk), gpuArray(N), gpuArray(xt), gm, gpuArray(QE), gpuArray(I), gpuArray(amb), gpuArray(DC), ...
+                                               lambda_residual, tau, gpuArray(vz_chunk), gpuArray(va_chunk));
+        end
+        
+        % 调用串行核心求解器
+        % 注意: 最后一个参数 'verbose' 设为 '' 来避免在 parfor 中打印信息
+        x_val_chunk = newton_opt_core_serial(objGrad_f_chunk, gpu, x0_chunk, 1e-4, 1e-7, 1e-5, 20, '');
+        
+        % 将结果存入 cell 数组
+        results_cell{i} = x_val_chunk;
+    end
+    
+    % --- 修改结束 ---
+
+    % 中文注释: 将所有块的结果重新组装回一个完整的向量。
+    zopt_active = zeros(1, N_active);
+    aopt_active = zeros(1, N_active);
+    for i = 1:num_workers
+        start_idx = (i-1) * chunk_size + 1;
+        end_idx = min(i * chunk_size, N_active);
+        if start_idx > N_active
+            continue;
+        end
+        if ~isempty(results_cell{i})
+            zopt_active(start_idx:end_idx) = results_cell{i}(1,:);
+            aopt_active(start_idx:end_idx) = results_cell{i}(2,:);
+        end
+    end
+    
+    % Project the ones that are not masked
+    zopt = vz;
+    aopt = va;
+    zopt(active_indices) = zopt_active;
+    aopt(active_indices) = aopt_active;
+    
+    % Reshape
+    rprox = cat(3, reshape(zopt,size(v,1),size(v,2)), reshape(aopt,size(v,1),size(v,2)));
+    
+return;
