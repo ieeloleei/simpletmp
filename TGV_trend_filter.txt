@@ -35,9 +35,10 @@ title(sprintf('TGV Filter (\\alpha_0=%.1f, \\alpha_1=%.1f)', alpha0, alpha1));
 grid on;
 
 function z = admm_tgv_filter_v2(z_hat, alpha0, alpha1, varargin)
-% ADMM_TGV_FILTER_V2 - (修正版) 使用ADMM算法求解二阶TGV趋势滤波问题
+% ADMM_TGV_FILTER_V2 - (最终修正版) 使用ADMM算法求解二阶TGV趋势滤波问题
 %
 % 解决了V1版本中因共享rho参数导致的数值不稳定和去噪效果差的问题。
+% 修正了V2草稿版本中的维度不匹配错误。
 %
 % 用法:
 %   z = admm_tgv_filter_v2(z_hat, alpha0, alpha1, 'rho1', val1, 'rho2', val2, ...)
@@ -52,6 +53,7 @@ function z = admm_tgv_filter_v2(z_hat, alpha0, alpha1, varargin)
 %   'rho2'     - (标量, >0) 对应约束 D1*w 的ADMM参数 (默认: alpha0/10)
 %   'max_iter' - (整数) 最大迭代次数 (默认: 500)
 %   'tol'      - (标量) 收敛容忍度 (默认: 1e-5)
+%   'verbose'  - (逻辑值) 是否打印迭代信息 (默认: true)
 %
 % 输出:
 %   z        - (N x 1) TGV滤波后的信号向量
@@ -61,35 +63,36 @@ p = inputParser;
 addRequired(p, 'z_hat', @isnumeric);
 addRequired(p, 'alpha0', @(x) isscalar(x) && x > 0);
 addRequired(p, 'alpha1', @(x) isscalar(x) && x > 0);
-% 为rho提供一个基于alpha的启发式默认值
 addParameter(p, 'rho1', alpha1*2, @(x) isscalar(x) && x > 0);
 addParameter(p, 'rho2', alpha0/10, @(x) isscalar(x) && x > 0);
 addParameter(p, 'max_iter', 500, @(x) isscalar(x) && x > 0);
 addParameter(p, 'tol', 1e-5, @(x) isscalar(x) && x > 0);
+addParameter(p, 'verbose', true, @islogical);
 parse(p, z_hat, alpha0, alpha1, varargin{:});
 
 rho1 = p.Results.rho1;
 rho2 = p.Results.rho2;
 max_iter = p.Results.max_iter;
 tol_abs = p.Results.tol;
+verbose = p.Results.verbose;
 
 % --- 2. 初始化和预计算 ---
 N = length(z_hat);
 z_hat = z_hat(:);
 
 % 构建一阶差分矩阵
-D1z = sparse(diff(eye(N), 1)); % 作用于 z, (N-1)xN
-D1w = sparse(diff(eye(N-1), 1)); % 作用于 w, (N-2)x(N-1)
+D1z = sparse(diff(eye(N), 1));     % 作用于 z, (N-1)xN
+D1w = sparse(diff(eye(N-1), 1));   % 作用于 w, (N-2)x(N-1)
 
 % 初始化 ADMM 变量
 z = z_hat;
 w = zeros(N - 1, 1);
 u1 = zeros(N - 1, 1);
 u2 = zeros(N - 2, 1);
-y1 = zeros(N - 1, 1);
-y2 = zeros(N - 2, 1);
+y1 = zeros(N - 1, 1); % 对偶变量 for D1z-w=u1
+y2 = zeros(N - 2, 1); % 对偶变量 for D1w=u2
 
-% **关键修正**: 构建使用 rho1 和 rho2 的块矩阵
+% 构建 (z,w)-update 的左侧块矩阵
 A11 = speye(N) + rho1 * (D1z' * D1z);
 A12 = -rho1 * D1z';
 A21 = -rho1 * D1z;
@@ -97,15 +100,20 @@ A22 = rho1 * speye(N-1) + rho2 * (D1w' * D1w);
 
 LHS = [A11, A12; A21, A22];
 % 预分解以加速
-[R, p_chol] = chol(LHS);
-if p_chol > 0
-    % 如果Cholesky分解失败 (矩阵非正定)，使用更稳健的LU分解
-    warning('Cholesky分解失败，矩阵可能非正定或病态。切换到LU分解。');
-    [L_lu, U_lu, P_lu] = lu(LHS);
+try
+    R = chol(LHS);
+    p_chol = 0;
+catch
+    p_chol = 1;
 end
-R_t = R';
 
-fprintf('开始 ADMM TGV滤波 (修正版 v2)...\n');
+if p_chol > 0
+    if verbose, warning('Cholesky分解失败，矩阵可能非正定或病态。切换到LU分解。'); end
+    [L_lu, U_lu, P_lu, Q_lu] = lu(LHS);
+end
+if p_chol == 0, R_t = R'; end
+
+if verbose, fprintf('开始 ADMM TGV滤波 (最终修正版 v2)...\n'); end
 
 % --- 3. ADMM 主循环 ---
 for k = 1:max_iter
@@ -119,7 +127,7 @@ for k = 1:max_iter
     if p_chol == 0
         zw = R \ (R_t \ RHS); % Cholesky求解
     else
-        zw = U_lu \ (L_lu \ (P_lu * RHS)); % LU求解
+        zw = Q_lu * (U_lu \ (L_lu \ (P_lu * RHS))); % LU求解
     end
     
     z = zw(1:N);
@@ -135,22 +143,21 @@ for k = 1:max_iter
     
     % d. 对偶变量更新
     y1 = y1 + (D1z_val - w - u1);
-    y2 = y2 + (D1w_val - w - u2); % <<-- 修正一个笔误，这里应该是 D1w_val
-    y2 = y2 + (D1w_val - u2); % <<-- 再次修正，根据ADMM标准形式
+    y2 = y2 + (D1w_val - u2); % <<--- *** 最终修正 ***
     
     % e. 检查收敛
-    change = norm(z - z_old, 'fro') / (norm(z_old, 'fro') + 1e-6);
-    if mod(k, 50) == 0
+    change = norm(z - z_old, 'fro') / (norm(z_old, 'fro') + 1e-12);
+    if verbose && (mod(k, 50) == 0 || k == 1)
         fprintf('Iter %d: Relative change = %.4e\n', k, change);
     end
     
     if change < tol_abs && k > 1
-        fprintf('在第 %d 次迭代收敛。\n', k);
+        if verbose, fprintf('在第 %d 次迭代收敛。\n', k); end
         break;
     end
 end
 
-if k == max_iter
+if k == max_iter && verbose
     fprintf('达到最大迭代次数 %d。\n', max_iter);
 end
 
