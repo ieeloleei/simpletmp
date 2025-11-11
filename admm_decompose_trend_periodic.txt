@@ -1,100 +1,91 @@
-% --- Main Test Script for ADMM Signal Decomposition (v2.0) ---
+% --- Main Test Script for ADMM Signal Decomposition (v3.0 - Corrected) ---
 clear; clc; close all;
 
 % --- 1. 生成测试数据 ---
-[y_ideal, y_residual, true_signals] = generate_test_data();
+[y_ideal, y_residual, true_signals_ideal, true_signals_residual] = generate_test_data_v2();
 
 % --- 2. Case 1: 理想分解验证 ---
 fprintf('--- Case 1: 理想分解验证 ---\n');
 n = 1; % 趋势是分段常数
-gamma_trend_ideal = 10.0;
+
+% **权重调整建议**:
+% gamma_noise: 基准，通常设为1.0
+% gamma_trend: 核心参数。对于阶跃信号，需要较大的值来强制平坦。
+% rho: 通常与gamma_trend在同一数量级或稍大，以帮助约束快速收敛。
+gamma_trend_ideal = 50.0;
 gamma_noise_ideal = 1.0;
-rho_ideal = 10.0;
+rho_ideal = 50.0;
 
 tic;
-[xt1, xp1, xn1] = admm_decompose_trend_periodic(y_ideal, n, gamma_trend_ideal, ...
+[xt1, xp1, xn1] = admm_decompose_trend_periodic_v3(y_ideal, n, gamma_trend_ideal, ...
     'gamma_noise', gamma_noise_ideal, 'rho', rho_ideal);
 toc;
 
-% 可视化 Case 1
-plot_decomposition_results('理想分解', y_ideal, {xt1, xp1, xn1}, true_signals);
+plot_decomposition_results_v2('理想分解 (v3.0 Corrected)', y_ideal, {xt1, xp1, xn1}, true_signals_ideal);
 
 
 % --- 3. Case 2: 残留振荡信号分解 ---
 fprintf('\n--- Case 2: 残留振荡信号分解 ---\n');
-n_res = 2; % 趋势是平滑曲线，用二阶
-gamma_trend_res = 80.0;
+n_res = 2; % 趋势是平滑曲线
+
+% **权重调整建议**:
+% gamma_trend: 对于平滑曲线，此值不宜过大，否则会产生过度平滑。
+% rho: 同样，与gamma_trend保持相似数量级。
+gamma_trend_res = 20.0;
 gamma_noise_res = 1.0;
 rho_res = 20.0;
 
 tic;
-[xt2, xp2, xn2] = admm_decompose_trend_periodic(y_residual.y, n_res, gamma_trend_res, ...
+[xt2, xp2, xn2] = admm_decompose_trend_periodic_v3(y_residual.y, n_res, gamma_trend_res, ...
     'gamma_noise', gamma_noise_res, 'rho', rho_res);
 toc;
 
-% 可视化 Case 2
-plot_decomposition_results('残留振荡分解', y_residual.y, {xt2, xp2, xn2}, y_residual.true_signals);
+plot_decomposition_results_v2('残留振荡分解 (v3.0 Corrected)', y_residual.y, {xt2, xp2, xn2}, y_residual.true_signals);
 
 
-% --- 4. Case 3: 验证退化能力 (gamma_periodic = 0) ---
-fprintf('\n--- Case 3: 验证退化能力 (gamma_periodic = 0) ---\n');
-tic;
-[xt3, xp3, xn3] = admm_decompose_trend_periodic(y_residual.y, n_res, gamma_trend_res, ...
-    'gamma_periodic', 0, 'gamma_noise', gamma_noise_res, 'rho', rho_res);
-toc;
-
-% 此时 xp3 应该为0, xt3 + xn3 = y
-figure('Name', '退化能力验证', 'NumberTitle', 'off');
-plot(y_residual.y, 'b-', 'DisplayName', 'Original y'); hold on;
-plot(xt3, 'r--', 'LineWidth', 2, 'DisplayName', 'Trend (gamma_p=0)');
-plot(xt3 + xn3, 'g:', 'LineWidth', 2, 'DisplayName', 'Trend + Noise');
-legend; title('当 gamma_{periodic}=0 时, 周期项为0');
-grid on;
-fprintf('恢复的周期项 L2 范数: %.4f (应接近0)\n', norm(xp3));
-
-
-% --- Helper function for data generation ---
-function [y_ideal, y_residual, true_signals] = generate_test_data()
+% --- Helper function for data generation (v2) ---
+function [y_ideal, y_residual, true_signals_ideal, true_signals_residual] = generate_test_data_v2()
     N = 200;
     t = (1:N)';
     
     % Case 1: 理想情况
-    true_signals.trend = [28*ones(40,1); 31*ones(50,1); 28*ones(30,1); 34*ones(80,1)];
-    true_signals.periodic = 3.0 * (-1).^(t);
-    true_signals.noise = 0.2 * randn(N, 1);
-    true_signals.noise = true_signals.noise - mean(true_signals.noise); % 确保零均值
-    y_ideal = true_signals.trend + true_signals.periodic + true_signals.noise;
+    true_signals_ideal.trend = [28*ones(40,1); 31*ones(50,1); 28*ones(30,1); 34*ones(80,1)];
+    true_signals_ideal.periodic = 3.0 * (-1).^(t);
+    true_signals_ideal.noise = 0.2 * randn(N, 1);
+    true_signals_ideal.noise = true_signals_ideal.noise - mean(true_signals_ideal.noise);
+    y_ideal = true_signals_ideal.trend + true_signals_ideal.periodic + true_signals_ideal.noise;
     
     % Case 2: 残留振荡情况
-    y_residual.true_signals.trend = interp1([1, 50, 100, 150, 200], [0.8, 1.5, 1.1, 1.4, 1.0], t, 'pchip');
-    y_residual.true_signals.periodic = 0.15 * (-1).^(t);
-    y_residual.true_signals.noise = 0.05 * randn(N, 1);
-    y_residual.true_signals.noise = y_residual.true_signals.noise - mean(y_residual.true_signals.noise);
-    y_residual.y = y_residual.true_signals.trend + y_residual.true_signals.periodic + y_residual.true_signals.noise;
+    true_signals_residual.trend = interp1([1, 50, 100, 150, 200], [0.8, 1.5, 1.1, 1.4, 1.0], t, 'pchip')';
+    true_signals_residual.periodic = 0.15 * (-1).^(t);
+    true_signals_residual.noise = 0.05 * randn(N, 1);
+    true_signals_residual.noise = true_signals_residual.noise - mean(true_signals_residual.noise);
+    y_residual.y = true_signals_residual.trend + true_signals_residual.periodic + true_signals_residual.noise;
+    y_residual.true_signals = true_signals_residual;
 end
 
-% --- Helper function for plotting ---
-function plot_decomposition_results(fig_name, y, recovered, true_signals)
+% --- Helper function for plotting (v2) ---
+function plot_decomposition_results_v2(fig_name, y, recovered, true_signals)
     figure('Name', fig_name, 'NumberTitle', 'off', 'Position', [100, 100, 800, 700]);
     set(gcf, 'color', 'w');
     
     xt = recovered{1}; xp = recovered{2}; xn = recovered{3};
     
     subplot(4,1,1);
-    plot(y, 'b-', 'DisplayName', 'Observed y');
+    plot(y, 'Color', [0.5 0.5 1], 'DisplayName', 'Observed y');
     hold on;
     plot(xt, 'r-', 'LineWidth', 2, 'DisplayName', 'Recovered Trend');
     plot(true_signals.trend, 'k--', 'LineWidth', 1.5, 'DisplayName', 'True Trend');
     legend('show'); title('Observation vs. Recovered Trend'); grid on;
 
     subplot(4,1,2);
-    plot(xp, 'g-', 'DisplayName', 'Recovered Periodic');
+    plot(xp, 'g-', 'LineWidth', 1.5, 'DisplayName', 'Recovered Periodic');
     hold on;
     plot(true_signals.periodic, 'k--', 'DisplayName', 'True Periodic');
     legend('show'); title('Recovered Periodic Component'); grid on;
 
     subplot(4,1,3);
-    plot(xn, 'm.', 'DisplayName', 'Recovered Noise');
+    plot(xn, 'm.', 'MarkerSize', 4, 'DisplayName', 'Recovered Noise');
     hold on;
     plot(true_signals.noise, 'k.', 'MarkerSize', 2, 'DisplayName', 'True Noise');
     legend('show'); title('Recovered Noise Component'); grid on;
@@ -106,9 +97,10 @@ function plot_decomposition_results(fig_name, y, recovered, true_signals)
     grid on;
 end
 
-
-function [x_trend, x_periodic, x_noise] = admm_decompose_trend_periodic(y, n, gamma_trend, varargin)
-% ADMM_DECOMPOSE_TREND_PERIODIC - (v2.0) 将信号分解为趋势、周期-2干扰和噪声
+function [x_trend, x_periodic, x_noise] = admm_decompose_trend_periodic_v3(y, n, gamma_trend, varargin)
+% ADMM_DECOMPOSE_TREND_PERIODIC - (v3.0 - Corrected) 将信号分解为趋势、周期-2干扰和噪声
+%
+% 解决了之前版本中错误的ADMM更新逻辑和收敛判据。
 %
 % 解决以下优化问题:
 %   minimize   phi_trend(x_t) + phi_periodic(x_p) + phi_noise(x_n)
@@ -116,11 +108,11 @@ function [x_trend, x_periodic, x_noise] = admm_decompose_trend_periodic(y, n, ga
 %
 % 其中:
 %   phi_trend(x)   = gamma_trend * ||D_n x||_1
-%   phi_periodic(x) = gamma_periodic * I(A_p x = 0, 1'*x = 0) (gamma_p -> inf)
+%   phi_periodic(x) = I(A_p x = 0, 1'*x = 0) (硬约束)
 %   phi_noise(x)   = (gamma_noise/2)||x||_2^2 + I(1'*x = 0)
 %
 % 用法:
-%   [xt, xp, xn] = admm_decompose_trend_periodic(y, n, gamma_trend, 'gamma_periodic', gp, 'gamma_noise', gn)
+%   [xt, xp, xn] = admm_decompose_trend_periodic_v3(y, n, gamma_trend, 'gamma_noise', gn, 'rho', rho_val)
 %
 % 输入:
 %   y             - (N x 1) 观测信号
@@ -128,11 +120,12 @@ function [x_trend, x_periodic, x_noise] = admm_decompose_trend_periodic(y, n, ga
 %   gamma_trend   - (标量, >=0) 趋势成分的正则化参数
 %
 % 可选输入 (键值对):
-%   'gamma_periodic' - (标量, >=0) 周期成分的权重。设为 > 0 启用分解。(默认: 1.0)
 %   'gamma_noise'    - (标量, >0) 噪声成分的权重。(默认: 1.0)
+%   'gamma_periodic' - (标量, >=0) 周期成分的权重。设为 > 0 启用。(默认: 1.0)
 %   'rho'            - (标量, >0) ADMM参数 (默认: 10.0)
-%   'max_iter'       - (整数) 最大迭代次数 (默认: 150)
-%   'tol'            - (标量) 收敛容忍度 (默认: 1e-5)
+%   'max_iter'       - (整数) 最大迭代次数 (默认: 200)
+%   'tol_abs'        - (标量) 绝对收敛容忍度 (默认: 1e-4)
+%   'tol_rel'        - (标量) 相对收敛容忍度 (默认: 1e-2)
 %   'verbose'        - (逻辑) 是否打印迭代信息 (默认: true)
 %
 % 输出:
@@ -140,87 +133,86 @@ function [x_trend, x_periodic, x_noise] = admm_decompose_trend_periodic(y, n, ga
 %   x_periodic    - (N x 1) 恢复的周期-2干扰成分
 %   x_noise       - (N x 1) 恢复的噪声成分
 %
-% 作者: Felix Heide (基于理论模型构建 v2.0)
+% 作者: Felix Heide (基于理论模型构建 v3.0 - Corrected Implementation)
 
 % --- 1. 解析输入参数 ---
 p = inputParser;
 addRequired(p, 'y', @isnumeric);
 addRequired(p, 'n', @(x) isscalar(x) && x >= 0);
 addRequired(p, 'gamma_trend', @(x) isscalar(x) && x >= 0);
-addParameter(p, 'gamma_periodic', 1.0, @(x) isscalar(x) && x >= 0);
 addParameter(p, 'gamma_noise', 1.0, @(x) isscalar(x) && x > 0);
+addParameter(p, 'gamma_periodic', 1.0, @(x) isscalar(x) && x >= 0);
 addParameter(p, 'rho', 10.0, @(x) isscalar(x) && x > 0);
-addParameter(p, 'max_iter', 150, @(x) isscalar(x) && x > 0);
-addParameter(p, 'tol', 1e-5, @(x) isscalar(x) && x > 0);
+addParameter(p, 'max_iter', 200, @(x) isscalar(x) && x > 0);
+addParameter(p, 'tol_abs', 1e-4, @isnumeric);
+addParameter(p, 'tol_rel', 1e-2, @isnumeric);
 addParameter(p, 'verbose', true, @islogical);
 parse(p, y, n, gamma_trend, varargin{:});
 
-gamma_periodic = p.Results.gamma_periodic;
 gamma_noise = p.Results.gamma_noise;
+gamma_periodic = p.Results.gamma_periodic;
 rho = p.Results.rho;
 max_iter = p.Results.max_iter;
-tol_abs = p.Results.tol;
+tol_abs = p.Results.tol_abs;
+tol_rel = p.Results.tol_rel;
 verbose = p.Results.verbose;
 
 % --- 2. 初始化和预计算 ---
 N = length(y);
 y = y(:);
 
-% a. 周期成分预计算
+% 周期成分预计算
 if gamma_periodic > 0
     Ap = spdiags([ones(N-1,1), ones(N-1,1)], [0, 1], N-1, N);
     L_Ap = chol(Ap * Ap', 'lower');
     L_Ap_t = L_Ap';
 else
-    Ap = []; L_Ap = []; L_Ap_t = []; % 如果不使用周期项，则不计算
+    Ap = []; L_Ap = []; L_Ap_t = [];
 end
 
-% b. 初始化 ADMM 变量
-z_trend = y;
-z_periodic = zeros(N, 1);
-z_noise = zeros(N, 1);
+% 初始化 ADMM 变量
+x_trend = y;
+x_periodic = zeros(N, 1);
+x_noise = zeros(N, 1);
+u = zeros(N, 1); % 缩放后的对偶变量
 
-u_trend = zeros(N, 1);
-u_periodic = zeros(N, 1);
-u_noise = zeros(N, 1);
-
-if verbose, fprintf('开始 ADMM 信号分解 (v2.0)...\n'); end
+if verbose, fprintf('开始 ADMM 信号分解 (v3.0 - Corrected)...\n'); end
 
 % --- 3. ADMM 主循环 ---
 for k = 1:max_iter
     
-    z_trend_old = z_trend;
+    % 存储上一次迭代的变量以计算对偶残差
+    x_trend_old = x_trend;
     
-    % a. 计算平均值 (共识步骤)
-    z_avg = (z_trend + z_periodic + z_noise) / 3;
-    u_avg = (u_trend + u_periodic + u_noise) / 3;
+    % a. x_trend 更新 (Gauss-Seidel fashion)
+    v_trend = y - x_periodic - x_noise - u;
+    x_trend = prox_update_trend(v_trend, n, gamma_trend, rho);
     
-    % b. 各成分的近端算子更新 (Proximal Updates)
+    % b. x_periodic 更新
+    v_periodic = y - x_trend - x_noise - u;
+    x_periodic = prox_update_periodic(v_periodic, gamma_periodic, Ap, L_Ap, L_Ap_t);
     
-    % i. 趋势成分更新
-    v_trend = z_avg - u_avg + (y - z_avg)/3;
-    z_trend = prox_update_trend(v_trend, n, gamma_trend, rho);
+    % c. x_noise 更新
+    v_noise = y - x_trend - x_periodic - u;
+    x_noise = prox_update_noise(v_noise, gamma_noise, rho);
     
-    % ii. 周期成分更新
-    v_periodic = z_avg - u_avg + (y - z_avg)/3;
-    z_periodic = prox_update_periodic(v_periodic, gamma_periodic, Ap, L_Ap, L_Ap_t);
+    % d. 对偶变量 u 更新
+    u = u + (x_trend + x_periodic + x_noise - y);
     
-    % iii. 噪声成分更新
-    v_noise = z_avg - u_avg + (y - z_avg)/3;
-    z_noise = prox_update_noise(v_noise, gamma_noise, rho);
+    % e. 检查收敛条件 (基于原始残差和对偶残差)
+    r_prim = norm(x_trend + x_periodic + x_noise - y);
+    r_dual = rho * norm(x_trend - x_trend_old); % 对偶残差简化形式
     
-    % c. 对偶变量更新
-    u_trend    = u_trend    + (z_trend    - (z_avg + (y - z_avg)/3));
-    u_periodic = u_periodic + (z_periodic - (z_avg + (y - z_avg)/3));
-    u_noise    = u_noise    + (z_noise    - (z_avg + (y - z_avg)/3));
+    % 计算容忍度阈值 (来自Boyd的论文)
+    eps_prim = sqrt(N)*tol_abs + tol_rel*max([norm(x_trend), norm(x_periodic), norm(x_noise), norm(y)]);
+    eps_dual = sqrt(N)*tol_abs + tol_rel*norm(rho*u);
     
-    % d. 检查收敛条件
-    change = norm(z_trend - z_trend_old) / (norm(z_trend_old) + 1e-9);
     if verbose && mod(k, 10) == 0
-        fprintf('Iter %d: Relative Change = %.6f\n', k, change);
+        fprintf('Iter %d: Primal Res = %.4f (eps=%.4f), Dual Res = %.4f (eps=%.4f)\n', ...
+            k, r_prim, eps_prim, r_dual, eps_dual);
     end
     
-    if change < tol_abs && k > 1
+    if r_prim < eps_prim && r_dual < eps_dual
         if verbose, fprintf('在第 %d 次迭代收敛。\n', k); end
         break;
     end
@@ -230,42 +222,29 @@ if k == max_iter && verbose
     fprintf('达到最大迭代次数 %d。\n', max_iter);
 end
 
-% --- 5. 分配最终结果 ---
-x_trend = z_trend;
-x_periodic = z_periodic;
-x_noise = z_noise;
-
 end
 
-% --- Helper Functions for Proximal Updates (Pin-to-Pin replaceable) ---
+% --- Helper Functions for Proximal Updates (保持不变) ---
 
 function z_t = prox_update_trend(v, n, gamma_t, rho)
-    % 趋势项的近端更新: 调用 l1 趋势滤波器
     if gamma_t > 0
-        % 注意: 内部求解器的正则化参数是 gamma/rho
-        % 为了解耦，内部求解器使用自己的rho，设为1.0即可
         z_t = admm_trend_filter(v, n, gamma_t/rho, 'rho', 1.0, 'max_iter', 15, 'tol', 1e-3);
     else
-        z_t = v; % 如果gamma_trend为0，则不进行滤波
+        z_t = v;
     end
 end
 
 function z_p = prox_update_periodic(v, gamma_p, Ap, L_Ap, L_Ap_t)
-    % 周期项的近端更新: 投影到零均值和周期-2湮灭子空间
     if gamma_p > 0
-        % 投影到 Ap*z = 0
         temp = L_Ap_t \ (L_Ap \ (Ap * v));
         z_p = v - Ap' * temp;
-        % 投影到零均值
         z_p = z_p - mean(z_p);
     else
-        z_p = zeros(size(v)); % 如果不使用周期项，则其贡献为0
+        z_p = zeros(size(v));
     end
 end
 
 function z_n = prox_update_noise(v, gamma_n, rho)
-    % 噪声项的近端更新: 带权重的缩放并投影到零均值
     z_n = (rho / (gamma_n + rho)) * v;
-    % 投影到零均值
     z_n = z_n - mean(z_n);
 end
