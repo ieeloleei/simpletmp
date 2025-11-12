@@ -1,0 +1,335 @@
+% --- 主测试脚本: 在终极测试波形上验证 v4.0 分解器 ---
+clear; clc; close all;
+
+% --- 1. 生成测试数据 ---
+[y, true_signals] = generate_ultimate_test_waveform();
+
+% --- 2. 设置分解参数 ---
+% 由于趋势包含分段线性和曲线，n=2 是一个好的选择。
+% 它惩罚斜率的变化，能够很好地拟合分段常数和分段线性部分。
+n = 2; 
+
+% **权重调整**: 这是一个关键的权衡过程
+% gamma_trend: 需要足够大以平滑噪声，但又不能太大以至于抹平曲线部分。
+% gamma_noise: 通常设为1.0作为基准。
+% rho: 通常与 gamma_trend 在同一数量级。
+gamma_trend = 70.0;
+gamma_noise = 1.0;
+rho = 70.0;
+gme_K = 10; % GME-TV 滤波器参数
+
+% --- 3. 运行分解算法 ---
+
+% a. 使用传统的 L1-TV 趋势项
+fprintf('\n--- 运行分解 (L1-TV 模式) ---\n');
+tic;
+[xt_l1, xp_l1, xn_l1] = admm_decompose_trend_periodic_v4(y, n, gamma_trend, ...
+    'gamma_noise', gamma_noise, 'rho', rho, 'use_gmetv', false);
+toc;
+
+% b. 使用增强的 GME-TV 趋势项
+fprintf('\n--- 运行分解 (GME-TV 模式) ---\n');
+tic;
+[xt_gme, xp_gme, xn_gme] = admm_decompose_trend_periodic_v4(y, n, gamma_trend, ...
+    'gamma_noise', gamma_noise, 'rho', rho, 'use_gmetv', true, 'gme_K', gme_K);
+toc;
+
+% --- 4. 可视化与对比分析 ---
+
+% a. 绘制 GME-TV 的完整分解结果
+plot_decomposition_results_v2('v4.0 GME-TV 分解结果', y, {xt_gme, xp_gme, xn_gme}, true_signals);
+
+% b. 创建 L1-TV 与 GME-TV 的效果对比图
+figure('Name', 'L1-TV vs GME-TV 趋势恢复对比', 'NumberTitle', 'off', 'Position', [150, 150, 1200, 500]);
+set(gcf, 'color', 'w');
+
+% 绘制完整趋势对比
+subplot(1, 2, 1);
+plot(y, 'Color', [0.8 0.8 1], 'DisplayName', '观测信号 y');
+hold on;
+plot(true_signals.trend, 'k-', 'LineWidth', 2.5, 'DisplayName', '真实趋势');
+plot(xt_l1, 'm--', 'LineWidth', 1.5, 'DisplayName', 'L1-TV 恢复趋势');
+plot(xt_gme, 'r-', 'LineWidth', 1.5, 'DisplayName', 'GME-TV 恢复趋势');
+legend('show', 'Location', 'best');
+title('完整趋势恢复对比');
+grid on;
+xlabel('样本索引');
+ylabel('幅值');
+
+% 放大第一个阶跃区域以观察“边沿陷落”
+subplot(1, 2, 2);
+plot(y, 'Color', [0.8 0.8 1], 'DisplayName', '观测信号 y');
+hold on;
+plot(true_signals.trend, 'k-', 'LineWidth', 2.5, 'DisplayName', '真实趋势');
+plot(xt_l1, 'm--', 'LineWidth', 2, 'DisplayName', 'L1-TV 恢复趋势');
+plot(xt_gme, 'r-', 'LineWidth', 2, 'DisplayName', 'GME-TV 恢复趋势');
+legend('show', 'Location', 'best');
+title('阶跃区域放大对比 (边沿陷落)');
+grid on;
+xlabel('样本索引');
+ylabel('幅值');
+xlim([130, 170]); % 放大第一个阶跃附近
+ylim([15, 25]);
+
+function [y, true_signals] = generate_ultimate_test_waveform()
+% GENERATE_ULTIMATE_TEST_WAVEFORM - 生成一个复杂的、多特征的测试信号
+%
+% 输出:
+%   y            - (N x 1) 最终的合成观测信号
+%   true_signals - (结构体) 包含了真实的趋势、周期和噪声分量
+
+    N = 800; % 信号总长度
+    t = (1:N)';
+
+    % --- 1. 构建分段的真实趋势信号 ---
+    x_trend_true = zeros(N, 1);
+
+    % 段 1: 阶跃 (常数)
+    idx1 = 1:150;
+    x_trend_true(idx1) = 20;
+
+    % 段 2: 直线斜边 (线性)
+    idx2 = 151:350;
+    x_trend_true(idx2) = linspace(20, 45, length(idx2));
+
+    % 段 3: 光滑弯曲曲线 (非线性)
+    idx3 = 351:600;
+    t_curve = linspace(0, pi, length(idx3));
+    x_trend_true(idx3) = 32.5 + 12.5 * cos(t_curve); % 从 45 平滑下降到 20
+
+    % 段 4: 阶跃 (常数)
+    idx4 = 601:N;
+    x_trend_true(idx4) = 10;
+
+    % --- 2. 构建周期和噪声信号 ---
+    
+    % 周期-2 干扰项 (零均值)
+    amplitude_p = 2.5;
+    x_periodic_true = amplitude_p * (-1).^(t);
+    x_periodic_true = x_periodic_true - mean(x_periodic_true);
+
+    % 高斯白噪声 (零均值)
+    noise_level = 0.5;
+    x_noise_true = noise_level * randn(N, 1);
+    x_noise_true = x_noise_true - mean(x_noise_true);
+
+    % --- 3. 合成最终信号 ---
+    y = x_trend_true + x_periodic_true + x_noise_true;
+
+    % --- 4. 保存真实分量 ---
+    true_signals.trend = x_trend_true;
+    true_signals.periodic = x_periodic_true;
+    true_signals.noise = x_noise_true;
+    
+    fprintf('终极测试波形已生成 (N=%d)。\n', N);
+end
+
+
+function [x_trend, x_periodic, x_noise] = admm_decompose_trend_periodic_v4(y, n, gamma_trend, varargin)
+% ADMM_DECOMPOSE_TREND_PERIODIC - (v4.0 - GME-TV Integration)
+%
+% 集成了 n 阶 GME-TV 以解决边沿陷落问题。
+%
+% 用法:
+%   ... = admm_decompose_trend_periodic_v4(y, n, gamma_trend, 'use_gmetv', true, 'gme_K', 10)
+%
+% 新增可选输入:
+%   'use_gmetv' - (逻辑) 是否使用 GME-TV 替换 L1-TV (默认: false)
+%   'gme_K'     - (整数) GME-TV 内部高通滤波器的参数 K (默认: 10)
+
+% --- 1. 解析输入参数 (在v3基础上增加) ---
+p = inputParser;
+addRequired(p, 'y', @isnumeric);
+addRequired(p, 'n', @(x) isscalar(x) && x >= 0);
+addRequired(p, 'gamma_trend', @(x) isscalar(x) && x >= 0);
+addParameter(p, 'gamma_noise', 1.0, @(x) isscalar(x) && x > 0);
+addParameter(p, 'gamma_periodic', 1.0, @(x) isscalar(x) && x >= 0);
+addParameter(p, 'rho', 10.0, @(x) isscalar(x) && x > 0);
+addParameter(p, 'max_iter', 200, @(x) isscalar(x) && x > 0);
+addParameter(p, 'tol_abs', 1e-4, @isnumeric);
+addParameter(p, 'tol_rel', 1e-2, @isnumeric);
+addParameter(p, 'verbose', true, @islogical);
+% --- 新增参数 ---
+addParameter(p, 'use_gmetv', false, @islogical);
+addParameter(p, 'gme_K', 10, @(x) isscalar(x) && x > 0);
+parse(p, y, n, gamma_trend, varargin{:});
+
+% (参数获取部分与v3相同)
+gamma_noise = p.Results.gamma_noise;
+gamma_periodic = p.Results.gamma_periodic;
+rho = p.Results.rho;
+max_iter = p.Results.max_iter;
+tol_abs = p.Results.tol_abs;
+tol_rel = p.Results.tol_rel;
+verbose = p.Results.verbose;
+use_gmetv = p.Results.use_gmetv;
+gme_K = p.Results.gme_K;
+
+
+% --- 2. 初始化和预计算 (与v3相同) ---
+N = length(y);
+y = y(:);
+if gamma_periodic > 0
+    Ap = spdiags([ones(N-1,1), ones(N-1,1)], [0, 1], N-1, N);
+    L_Ap = chol(Ap * Ap', 'lower'); L_Ap_t = L_Ap';
+else
+    Ap = []; L_Ap = []; L_Ap_t = [];
+end
+x_trend = y; x_periodic = zeros(N, 1); x_noise = zeros(N, 1);
+u = zeros(N, 1);
+
+if verbose
+    fprintf('开始 ADMM 信号分解 (v4.0 - GME-TV: %s)...\n', mat2str(use_gmetv));
+end
+
+% --- 3. ADMM 主循环 (与v3几乎相同) ---
+for k = 1:max_iter
+    x_trend_old = x_trend;
+    
+    % a. x_trend 更新 (核心修改点)
+    v_trend = y - x_periodic - x_noise - u;
+    if use_gmetv
+        x_trend = prox_update_trend_gmetv(v_trend, n, gamma_trend, rho, gme_K);
+    else
+        x_trend = prox_update_trend(v_trend, n, gamma_trend, rho); % 调用旧的 L1-TV
+    end
+    
+    % b. x_periodic 更新 (不变)
+    v_periodic = y - x_trend - x_noise - u;
+    x_periodic = prox_update_periodic(v_periodic, gamma_periodic, Ap, L_Ap, L_Ap_t);
+    
+    % c. x_noise 更新 (不变)
+    v_noise = y - x_trend - x_periodic - u;
+    x_noise = prox_update_noise(v_noise, gamma_noise, rho);
+    
+    % d. 对偶变量 u 更新 (不变)
+    u = u + (x_trend + x_periodic + x_noise - y);
+    
+    % e. 检查收敛条件 (不变)
+    r_prim = norm(x_trend + x_periodic + x_noise - y);
+    r_dual = rho * norm(x_trend - x_trend_old);
+    eps_prim = sqrt(N)*tol_abs + tol_rel*max([norm(x_trend), norm(x_periodic), norm(x_noise), norm(y)]);
+    eps_dual = sqrt(N)*tol_abs + tol_rel*norm(rho*u);
+    
+    if verbose && mod(k, 10) == 0
+        fprintf('Iter %d: Primal Res = %.4f (eps=%.4f), Dual Res = %.4f (eps=%.4f)\n', ...
+            k, r_prim, eps_prim, r_dual, eps_dual);
+    end
+    
+    if r_prim < eps_prim && r_dual < eps_dual
+        if verbose, fprintf('在第 %d 次迭代收敛。\n', k); end
+        break;
+    end
+end
+
+if k == max_iter && verbose, fprintf('达到最大迭代次数 %d。\n', max_iter); end
+
+end
+
+% --- Helper Functions (与v3相同) ---
+function z_t = prox_update_trend(v, n, gamma_t, rho)
+    if gamma_t > 0
+        z_t = admm_trend_filter(v, n, gamma_t/rho, 'rho', 1.0, 'max_iter', 15, 'tol', 1e-3);
+    else
+        z_t = v;
+    end
+end
+function z_p = prox_update_periodic(v, gamma_p, Ap, L_Ap, L_Ap_t)
+    if gamma_p > 0
+        temp = L_Ap_t \ (L_Ap \ (Ap * v));
+        z_p = v - Ap' * temp;
+        z_p = z_p - mean(z_p);
+    else
+        z_p = zeros(size(v));
+    end
+end
+function z_n = prox_update_noise(v, gamma_n, rho)
+    z_n = (rho / (gamma_n + rho)) * v;
+    z_n = z_n - mean(z_n);
+end
+
+function x = prox_update_trend_gmetv(y, n, gamma, rho, K, varargin)
+% PROX_UPDATE_TREND_GMETV - n阶GME-TV的近端算子
+%
+% 解决以下优化问题:
+%   minimize (gamma/rho) * psi_GME(D_n x) + (1/2)||x - y||_2^2
+%
+% 这是 Selesnick 的 tvd_gme 的 n 阶推广版，并适配 ADMM 框架。
+
+% --- 解析可选参数 ---
+p = inputParser;
+addParameter(p, 'max_iter', 20, @isscalar);
+addParameter(p, 'tol', 1e-5, @isscalar);
+parse(p, varargin{:});
+max_iters_gme = p.Results.max_iter;
+tol_gme = p.Results.tol;
+
+% --- 初始化和预计算 ---
+N = length(y);
+lam = gamma / rho; % ADMM框架下的有效lambda
+
+% a. 构建 n 阶差分矩阵 Dn
+Dn = diff(speye(N), n);
+Dn = sparse(Dn);
+
+% b. 构建 n 阶 GME 滤波器 C
+% 参考 tvd_gme.m, H = G*D, B = C*D. 我们需要 Hn = Gn*Dn
+% h 是一个 (2K-1) 点的高通滤波器
+hh = ones(1, K) / K;
+h = [zeros(1, K-1), 1, zeros(1, K-1)] - conv(hh, hh);
+
+% gn 是通过解卷积 h = gn * dn 得到的
+% dn 是 n 阶差分的脉冲响应, e.g., d1=[1,-1], d2=[1,-2,1]
+dn_impulse = diff([zeros(n,1); 1; zeros(n,1)], n);
+gn = deconv(h, dn_impulse');
+gn = gn(:)'; % 确保是行向量
+
+% 从 gn 构建卷积矩阵 Cn
+Cn = (1/sqrt(lam)) * sparse_convmtx(gn, size(Dn,1) - (length(gn)-1));
+
+% c. 初始化 GME-TV 内部迭代变量
+x = admm_trend_filter(y, n, lam); % 使用标准L1-TV作为热启动
+x_old = x;
+v = zeros(N-n, 1); % ISTA 子问题的变量
+
+% d. ISTA 子问题参数
+Cf_sq = abs(freqz(Cn(1,:), 1, N)).^2;
+rho_ista = max(Cf_sq);
+alpha_ista = 1.6 / rho_ista;
+Nit_ista = 10;
+soft = @(t, T) max(t - T, 0) + min(t + T, 0);
+
+iter = 0;
+relative_delta = inf;
+
+% --- GME-TV 内部主循环 (来自 tvd_gme) ---
+while (relative_delta > tol_gme) && (iter < max_iters_gme)
+    iter = iter + 1;
+    
+    Dnx = Dn * x;
+    
+    % 1. v-update: 使用 ISTA 求解 l1-ls 子问题
+    for k_ista = 1:Nit_ista
+        v = soft(v - alpha_ista * (Cn' * (Cn * (v - Dnx))), alpha_ista);
+    end
+    
+    % 2. z-update
+    z = Dn' * (Cn' * (Cn * (Dnx - v)));
+    
+    % 3. x-update: 标准 l1-TV 去噪
+    x = admm_trend_filter(y + lam * z, n, lam);
+    
+    % 检查收敛
+    relative_delta = norm(x - x_old, 2) / (norm(x_old, 2) + 1e-9);
+    x_old = x;
+end
+
+end
+
+% --- Helper function from tvd_gme ---
+function H = sparse_convmtx(h, N)
+    % 构造稀疏卷积矩阵
+    L = length(h);
+    h = h(end:-1:1);
+    H = spdiags(repmat(h,N,1), 0:(L-1), N, N+L-1);
+end
