@@ -266,34 +266,34 @@ tol_gme = p.Results.tol;
 
 % --- 初始化和预计算 ---
 N = length(y);
-lam = gamma / rho; % ADMM框架下的有效lambda
+lam = gamma / rho;
 
 % a. 构建 n 阶差分矩阵 Dn
 Dn = diff(speye(N), n);
 Dn = sparse(Dn);
 
 % b. 构建 n 阶 GME 滤波器 C
-% 参考 tvd_gme.m, H = G*D, B = C*D. 我们需要 Hn = Gn*Dn
-% h 是一个 (2K-1) 点的高通滤波器
 hh = ones(1, K) / K;
 h = [zeros(1, K-1), 1, zeros(1, K-1)] - conv(hh, hh);
-
-% gn 是通过解卷积 h = gn * dn 得到的
-% dn 是 n 阶差分的脉冲响应, e.g., d1=[1,-1], d2=[1,-2,1]
 dn_impulse = diff([zeros(n,1); 1; zeros(n,1)], n);
 gn = deconv(h, dn_impulse');
-gn = gn(:)'; % 确保是行向量
+gn = gn(:)';
 
 % 从 gn 构建卷积矩阵 Cn
 Cn = (1/sqrt(lam)) * sparse_convmtx(gn, size(Dn,1) - (length(gn)-1));
 
 % c. 初始化 GME-TV 内部迭代变量
-x = admm_trend_filter(y, n, lam); % 使用标准L1-TV作为热启动
+x = admm_trend_filter(y, n, lam);
 x_old = x;
-v = zeros(N-n, 1); % ISTA 子问题的变量
+v = zeros(N-n, 1);
 
 % d. ISTA 子问题参数
-Cf_sq = abs(freqz(Cn(1,:), 1, N)).^2;
+% --- 核心修正点 ---
+% 强制将稀疏行向量 Cn(1,:) 转换为全矩阵，以兼容 freqz
+Cn_full_row = full(Cn(1,:)); 
+Cf_sq = abs(freqz(Cn_full_row, 1, N)).^2; 
+% --- 修正结束 ---
+
 rho_ista = max(Cf_sq);
 alpha_ista = 1.6 / rho_ista;
 Nit_ista = 10;
