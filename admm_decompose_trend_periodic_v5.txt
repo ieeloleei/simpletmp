@@ -1,0 +1,139 @@
+function [x_trend, x_periodic, x_noise] = admm_decompose_trend_periodic_v5(y, mask, n, gamma_trend, varargin)
+% ADMM_DECOMPOSE_TREND_PERIODIC_MASK - (v5.0 - Hard Constraint for DC Offset)
+%
+% 严格实现零均值硬约束以解决直流偏置问题。
+%
+% 优化问题形式化:
+%   minimize   phi_trend(x_t) + phi_periodic(x_p) + phi_noise(x_n)
+%   subject to M(x_t + x_p + x_n) = M(y)
+%              1'*x_p = 0,  1'*x_n = 0
+%
+% 用法:
+%   [xt, xp, xn] = admm_decompose_trend_periodic_v5(y, mask, n, gamma_trend, ...)
+
+% --- 1. 解析输入参数 ---
+p = inputParser;
+addRequired(p, 'y', @isnumeric);
+addRequired(p, 'mask', @(x) isnumeric(x) || islogical(x));
+addRequired(p, 'n', @(x) isscalar(x) && x >= 0);
+addRequired(p, 'gamma_trend', @(x) isscalar(x) && x >= 0);
+addParameter(p, 'gamma_noise', 1.0, @(x) isscalar(x) && x > 0);
+addParameter(p, 'gamma_periodic', 1.0, @(x) isscalar(x) && x >= 0);
+addParameter(p, 'rho', 10.0, @(x) isscalar(x) && x > 0);
+addParameter(p, 'max_iter', 200, @(x) isscalar(x) && x > 0);
+addParameter(p, 'tol_abs', 1e-4, @isnumeric);
+addParameter(p, 'tol_rel', 1e-2, @isnumeric);
+addParameter(p, 'verbose', true, @islogical);
+addParameter(p, 'use_gmetv', false, @islogical); % 接口保留
+addParameter(p, 'gme_K', 10, @(x) isscalar(x) && x > 0); % 接口保留
+parse(p, y, mask, n, gamma_trend, varargin{:});
+
+gamma_noise = p.Results.gamma_noise;
+gamma_periodic = p.Results.gamma_periodic;
+rho = p.Results.rho;
+max_iter = p.Results.max_iter;
+tol_abs = p.Results.tol_abs;
+tol_rel = p.Results.tol_rel;
+verbose = p.Results.verbose;
+use_gmetv = p.Results.use_gmetv;
+gme_K = p.Results.gme_K;
+
+% --- 2. 初始化和预计算 ---
+N = length(y);
+y = y(:);
+mask = logical(mask(:));
+
+if gamma_periodic > 0
+    Ap = spdiags([ones(N-1,1), ones(N-1,1)], [0, 1], N-1, N);
+    L_Ap = chol(Ap * Ap', 'lower'); L_Ap_t = L_Ap';
+else
+    Ap = []; L_Ap = []; L_Ap_t = [];
+end
+
+% 初始化 ADMM 变量
+x_trend = y;
+x_periodic = zeros(N, 1);
+x_noise = zeros(N, 1);
+u = zeros(N, 1);
+
+if verbose
+    fprintf('开始 ADMM 信号分解 (v5.0 - Hard Constraint)...\n');
+end
+
+% --- 3. ADMM 主循环 ---
+for k = 1:max_iter
+    x_trend_old = x_trend;
+    
+    % a. x_trend 更新 (不受零均值约束)
+    v_trend = y - x_periodic - x_noise - u;
+    if use_gmetv
+        % ** GME-TV 接口保留处 **
+        warning('GME-TV with masking is not yet implemented. Falling back to L1-TV.');
+        x_trend = prox_update_trend_masked(v_trend, mask, n, gamma_trend, rho);
+    else
+        x_trend = prox_update_trend_masked(v_trend, mask, n, gamma_trend, rho);
+    end
+    
+    % b. x_periodic 更新 (增加零均值投影)
+    v_periodic = y - x_trend - x_noise - u;
+    x_periodic_uncons = prox_update_periodic_uncons(v_periodic, gamma_periodic, Ap, L_Ap, L_Ap_t);
+    x_periodic = x_periodic_uncons - mean(x_periodic_uncons); % 投影到零均值空间
+    
+    % c. x_noise 更新 (增加零均值投影)
+    v_noise = y - x_trend - x_periodic - u;
+    x_noise_uncons = prox_update_noise_masked(v_noise, mask, gamma_noise, rho);
+    x_noise = x_noise_uncons - mean(x_noise_uncons); % 投影到零均值空间
+    
+    % d. 对偶变量 u 更新
+    residual = x_trend + x_periodic + x_noise - y;
+    u(mask) = u(mask) + residual(mask);
+    
+    % e. 检查收敛条件
+    r_prim = norm(residual(mask));
+    r_dual = rho * norm(x_trend - x_trend_old);
+    
+    eps_prim = sqrt(sum(mask))*tol_abs + tol_rel*max([norm(x_trend), norm(x_periodic), norm(x_noise), norm(y(mask))]);
+    eps_dual = sqrt(N)*tol_abs + tol_rel*norm(rho*u);
+    
+    if verbose && mod(k, 10) == 0
+        fprintf('Iter %d: Primal Res = %.4f (eps=%.4f), Dual Res = %.4f (eps=%.4f)\n', ...
+            k, r_prim, eps_prim, r_dual, eps_dual);
+    end
+    
+    if r_prim < eps_prim && r_dual < eps_dual
+        if verbose, fprintf('在第 %d 次迭代收敛。\n', k); end
+        break;
+    end
+end
+
+if k == max_iter && verbose, fprintf('达到最大迭代次数 %d。\n', max_iter); end
+
+end
+
+% --- Helper Functions for Proximal Updates ---
+
+function z_t = prox_update_trend_masked(v, mask, n, gamma_t, rho)
+    % (与 v4.1 相同)
+    if gamma_t > 0
+        z_t = admm_trend_filter_masked(v, n, gamma_t/rho, mask, 'rho', 1.0, 'max_iter', 20);
+    else
+        z_t = v;
+    end
+end
+
+function z_p = prox_update_periodic_uncons(v, gamma_p, Ap, L_Ap, L_Ap_t)
+    % **新**: 无约束的周期项近端算子
+    if gamma_p > 0
+        temp = L_Ap_t \ (L_Ap \ (Ap * v));
+        z_p = v - Ap' * temp;
+    else
+        z_p = zeros(size(v));
+    end
+end
+
+function z_n = prox_update_noise_masked(v, mask, gamma_n, rho)
+    % **新**: 无约束的噪声项近端算子
+    z_n = zeros(size(v));
+    z_n(mask) = (rho / (gamma_n + rho)) * v(mask);
+    z_n(~mask) = v(~mask);
+end
