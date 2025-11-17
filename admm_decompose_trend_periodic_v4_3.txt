@@ -1,0 +1,283 @@
+% --- 测试脚本: 验证 v4.3 的任意周期分解功能 ---
+clear; clc; close all;
+
+% --- 1. 生成测试数据 (带周期-10干扰) ---
+N = 300;
+t = (1:N)';
+P = 10; % 设定干扰周期
+
+% a. 真实趋势信号
+true_signals.trend = interp1([1, 80, 150, 220, 300], [10, 20, 5, 15, 12], t, 'pchip')';
+
+% b. 周期-P 干扰信号
+amplitude_p = 1.5;
+true_signals.periodic = amplitude_p * sin(2 * pi * t / P);
+true_signals.periodic = true_signals.periodic - mean(true_signals.periodic); % 确保零均值
+
+% c. 噪声
+true_signals.noise = 0.2 * randn(N, 1);
+true_signals.noise = true_signals.noise - mean(true_signals.noise);
+
+% d. 合成信号
+y = true_signals.trend + true_signals.periodic + true_signals.noise;
+
+% --- 2. 设置分解参数 ---
+n = 2; % 平滑趋势
+gamma_trend = 20.0;
+gamma_noise = 1.0;
+rho = 20.0;
+gamma_periodic = 1.0; % 启用周期分解
+
+% --- 3. 运行 v4.3 分解器 ---
+fprintf('\n--- 运行 v4.3 (周期 P=%d) ---\n', P);
+tic;
+[xt, xp, xn] = admm_decompose_trend_periodic_v4_3(y, true(N,1), n, gamma_trend, ...
+    'gamma_noise', gamma_noise, 'rho', rho, ...
+    'gamma_periodic', gamma_periodic, 'periodic_period', P);
+toc;
+
+% --- 4. 可视化结果 ---
+figure('Name', 'v4.3 任意周期分解验证', 'NumberTitle', 'off', 'Position', [100, 100, 800, 700]);
+set(gcf, 'color', 'w');
+
+subplot(4,1,1);
+plot(t, y, 'Color', [0.5 0.5 1], 'DisplayName', '观测信号 y');
+hold on;
+plot(t, xt, 'r-', 'LineWidth', 2, 'DisplayName', '恢复趋势');
+plot(t, true_signals.trend, 'k--', 'LineWidth', 1.5, 'DisplayName', '真实趋势');
+legend('show'); title('观测 vs. 恢复趋势'); grid on;
+
+subplot(4,1,2);
+plot(t, xp, 'g-', 'LineWidth', 1.5, 'DisplayName', '恢复周期项');
+hold on;
+plot(t, true_signals.periodic, 'k--', 'DisplayName', '真实周期项');
+legend('show'); title(sprintf('恢复的周期-%d成分', P)); grid on;
+
+subplot(4,1,3);
+plot(t, xn, 'm.', 'MarkerSize', 4, 'DisplayName', '恢复噪声');
+legend('show'); title('恢复的噪声成分'); grid on;
+
+subplot(4,1,4);
+residual = y - (xt + xp + xn);
+plot(t, residual, 'c-');
+title(sprintf('最终重建误差 (L2 Norm: %.4f)', norm(residual)));
+grid on;
+
+function [x_trend, x_periodic, x_noise] = admm_decompose_trend_periodic_v4_3(y, mask, n, gamma_trend, varargin)
+% ADMM_DECOMPOSE_TREND_PERIODIC - (v4.3 - Arbitrary Period Support)
+%
+% 增加了对任意指定周期的周期性干扰的分离能力。
+%
+% 新增可选输入:
+%   'periodic_period' - (整数, >1) 要分离的周期性干扰的周期。(默认: 2)
+
+% --- 1. 解析输入参数 ---
+p = inputParser;
+addRequired(p, 'y', @isnumeric);
+addRequired(p, 'mask', @(x) isnumeric(x) || islogical(x));
+addRequired(p, 'n', @(x) isscalar(x) && x >= 0);
+addRequired(p, 'gamma_trend', @(x) isscalar(x) && x >= 0);
+addParameter(p, 'gamma_noise', 1.0, @(x) isscalar(x) && x > 0);
+addParameter(p, 'gamma_periodic', 1.0, @(x) isscalar(x) && x >= 0);
+addParameter(p, 'rho', 10.0, @(x) isscalar(x) && x > 0);
+addParameter(p, 'max_iter', 200, @(x) isscalar(x) && x > 0);
+addParameter(p, 'tol_abs', 1e-4, @isnumeric);
+addParameter(p, 'tol_rel', 1e-2, @isnumeric);
+addParameter(p, 'verbose', true, @islogical);
+addParameter(p, 'use_gmetv', false, @islogical);
+addParameter(p, 'gme_K', 10, @(x) isscalar(x) && x > 0);
+% --- 新增参数 ---
+addParameter(p, 'periodic_period', 2, @(x) isscalar(x) && x > 1 && round(x)==x);
+parse(p, y, mask, n, gamma_trend, varargin{:});
+
+gamma_noise = p.Results.gamma_noise;
+gamma_periodic = p.Results.gamma_periodic;
+rho = p.Results.rho;
+max_iter = p.Results.max_iter;
+tol_abs = p.Results.tol_abs;
+tol_rel = p.Results.tol_rel;
+verbose = p.Results.verbose;
+use_gmetv = p.Results.use_gmetv;
+gme_K = p.Results.gme_K;
+periodic_period = p.Results.periodic_period;
+
+% --- 2. 初始化和预计算 ---
+N = length(y);
+y = y(:);
+mask = logical(mask(:));
+num_good_points = sum(mask);
+mean_y_masked = sum(y(mask)) / num_good_points;
+
+% **核心修改**: 构建泛化的周期湮灭算子 Ap
+if gamma_periodic > 0
+    P = periodic_period;
+    if N <= P
+        error('信号长度 N 必须大于周期 P。');
+    end
+    I = speye(N);
+    Ap = I(P+1:N, :) - I(1:N-P, :);
+    L_Ap = chol(Ap * Ap', 'lower'); 
+    L_Ap_t = L_Ap';
+else
+    Ap = []; L_Ap = []; L_Ap_t = [];
+end
+
+% ADMM 变量初始化 (与v4.2相同)
+x_trend = y; x_periodic = zeros(N, 1); x_noise = zeros(N, 1);
+z_trend = x_trend; z_periodic = x_periodic; z_noise = x_noise;
+u_trend = zeros(N, 1); u_periodic = zeros(N, 1); u_noise = zeros(N, 1);
+
+if verbose
+    fprintf('开始 ADMM 信号分解 (v4.3 - Arbitrary Period: %d)...\n', periodic_period);
+end
+
+% --- 3. ADMM 主循环 (与v4.2完全相同) ---
+for k = 1:max_iter
+    z_trend_old = z_trend;
+    
+    % a. x-updates
+    x_trend    = prox_update_trend_masked(z_trend - u_trend, mask, n, gamma_trend, rho, use_gmetv, gme_K);
+    x_periodic = prox_update_periodic(z_periodic - u_periodic, gamma_periodic, Ap, L_Ap, L_Ap_t);
+    x_noise    = prox_update_noise(z_noise - u_noise, gamma_noise, rho);
+    
+    % b. z-updates (联合投影)
+    xt_tilde = x_trend + u_trend;
+    xp_tilde = x_periodic + u_periodic;
+    xn_tilde = x_noise + u_noise;
+    
+    s_tilde = xt_tilde + xp_tilde + xn_tilde;
+    residual = s_tilde(mask) - y(mask);
+    
+    z_trend(mask) = xt_tilde(mask) - residual/3;
+    z_periodic(mask) = xp_tilde(mask) - residual/3;
+    z_noise(mask) = xn_tilde(mask) - residual/3;
+    
+    z_trend(~mask) = xt_tilde(~mask);
+    z_periodic(~mask) = xp_tilde(~mask);
+    z_noise(~mask) = xn_tilde(~mask);
+    
+    current_mean_zt = sum(z_trend(mask)) / num_good_points;
+    mean_diff = current_mean_zt - mean_y_masked;
+    
+    z_trend(mask) = z_trend(mask) - mean_diff;
+    z_periodic(mask) = z_periodic(mask) + mean_diff / 2;
+    z_noise(mask) = z_noise(mask) + mean_diff / 2;
+    
+    % c. u-updates
+    u_trend    = u_trend    + (x_trend - z_trend);
+    u_periodic = u_periodic + (x_periodic - z_periodic);
+    u_noise    = u_noise    + (x_noise - z_noise);
+    
+    % d. 检查收敛条件
+    r_prim1 = norm(z_trend(mask) + z_periodic(mask) + z_noise(mask) - y(mask));
+    r_prim2 = abs(sum(z_trend(mask))/num_good_points - mean_y_masked);
+    r_dual = rho * norm(z_trend - z_trend_old);
+    
+    if verbose && mod(k, 10) == 0
+        fprintf('Iter %d: Primal Res (sum) = %.4f, Primal Res (mean) = %.4f, Dual Res = %.4f\n', ...
+            k, r_prim1, r_prim2, r_dual);
+    end
+    
+    if r_prim1 < tol_abs && r_prim2 < tol_abs && r_dual < tol_abs
+        if verbose, fprintf('在第 %d 次迭代收敛。\n', k); end
+        break;
+    end
+end
+
+if k == max_iter && verbose, fprintf('达到最大迭代次数 %d。\n', max_iter); end
+
+% --- 4. 分配最终结果 ---
+x_trend = z_trend;
+x_periodic = z_periodic;
+x_noise = z_noise;
+
+end
+
+% --- Helper Functions ---
+
+function z_t = prox_update_trend_masked(v, mask, n, gamma_t, rho, use_gmetv, gme_K)
+    if use_gmetv
+        % GME-TV 接口保留
+        warning('GME-TV with masking is not yet implemented. Falling back to L1-TV.');
+        z_t = admm_trend_filter_masked(v, n, gamma_t/rho, mask, 'rho', 1.0, 'max_iter', 20);
+    else
+        if gamma_t > 0
+            z_t = admm_trend_filter_masked(v, n, gamma_t/rho, mask, 'rho', 1.0, 'max_iter', 20);
+        else
+            z_t = v;
+        end
+    end
+end
+
+function z_p = prox_update_periodic(v, gamma_p, Ap, L_Ap, L_Ap_t)
+    if gamma_p > 0
+        temp = L_Ap_t \ (L_Ap \ (Ap * v));
+        z_p = v - Ap' * temp;
+        z_p = z_p - mean(z_p);
+    else
+        z_p = zeros(size(v));
+    end
+end
+
+function z_n = prox_update_noise(v, gamma_n, rho)
+    z_n = (rho / (gamma_n + rho)) * v;
+    z_n = z_n - mean(z_n);
+end
+
+% --- Sub-function: Masked Trend Filter (与v4.2相同) ---
+function z = admm_trend_filter_masked(z_hat, n, gamma, mask, varargin)
+    p = inputParser;
+    addRequired(p, 'z_hat', @isnumeric);
+    addRequired(p, 'n', @(x) isscalar(x) && x >= 0);
+    addRequired(p, 'gamma', @(x) isscalar(x) && x > 0);
+    addRequired(p, 'mask', @(x) isnumeric(x) || islogical(x));
+    addParameter(p, 'rho', 1.0, @(x) isscalar(x) && x > 0);
+    addParameter(p, 'max_iter', 50, @(x) isscalar(x) && x > 0);
+    addParameter(p, 'tol', 1e-4, @(x) isscalar(x) && x > 0);
+    parse(p, z_hat, n, gamma, mask, varargin{:});
+
+    rho = p.Results.rho;
+    max_iter = p.Results.max_iter;
+    tol_abs = p.Results.tol;
+
+    N = length(z_hat);
+    z_hat = z_hat(:);
+    mask = logical(mask(:));
+
+    D = diff(speye(N), n);
+    D = sparse(D);
+
+    z = z_hat;
+    u = zeros(N - n, 1);
+    y = zeros(N - n, 1);
+
+    M_mask = spdiags(double(mask), 0, N, N);
+    LHS = M_mask + rho * (D' * D);
+    
+    try
+        R = chol(LHS);
+        R_t = R';
+        use_chol = true;
+    catch
+        use_chol = false;
+    end
+
+    for k = 1:max_iter
+        u_old = u;
+        RHS = M_mask * z_hat + rho * D' * (u - y);
+        if use_chol
+            z = R \ (R_t \ RHS);
+        else
+            z = LHS \ RHS;
+        end
+        
+        Dz_plus_y = D * z + y;
+        threshold = gamma / rho;
+        u = max(0, Dz_plus_y - threshold) - max(0, -Dz_plus_y - threshold);
+        y = y + (D * z - u);
+        
+        if norm(u - u_old) < tol_abs
+            break;
+        end
+    end
+end
