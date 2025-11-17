@@ -95,7 +95,7 @@ function [x_trend, x_periodic, x_noise] = admm_decompose_trend_periodic_v4_1(y, 
 % --- 1. 解析输入参数 ---
 p = inputParser;
 addRequired(p, 'y', @isnumeric);
-addRequired(p, 'mask', @isnumeric);
+addRequired(p, 'mask', @(x) isnumeric(x) || islogical(x));
 addRequired(p, 'n', @(x) isscalar(x) && x >= 0);
 addRequired(p, 'gamma_trend', @(x) isscalar(x) && x >= 0);
 addParameter(p, 'gamma_noise', 1.0, @(x) isscalar(x) && x > 0);
@@ -251,7 +251,7 @@ p = inputParser;
 addRequired(p, 'z_hat', @isnumeric);
 addRequired(p, 'n', @(x) isscalar(x) && x >= 0);
 addRequired(p, 'gamma', @(x) isscalar(x) && x > 0);
-addRequired(p, 'mask', @isnumeric);
+addRequired(p, 'mask', @(x) isnumeric(x) || islogical(x));
 addParameter(p, 'rho', 1.0, @(x) isscalar(x) && x > 0);
 addParameter(p, 'max_iter', 50, @(x) isscalar(x) && x > 0);
 addParameter(p, 'tol', 1e-4, @(x) isscalar(x) && x > 0);
