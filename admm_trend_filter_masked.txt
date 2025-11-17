@@ -1,84 +1,250 @@
-% --- 主测试脚本: 在带周期性尖峰的信号上验证 v4.1 的掩码功能 ---
+% --- 测试脚本: 验证 v4.1 的掩码功能 ---
 clear; clc; close all;
 
 % --- 1. 生成符合描述的测试数据 ---
 N = 200;
 t = (1:N)';
+y = zeros(N,1);
 
-% a. 基础平滑趋势
-true_trend = interp1([1, 40, 120, 200], [3, 2.5, 2.8, 1.2], t, 'pchip')';
+% 构造分段平滑趋势 + 周期性尖峰
+y(1:125) = interp1([1, 20, 40, 60, 80, 100, 125], [3.1, 2.6, 2.5, 2.3, 2.4, 2.5, 2.8], 1:125, 'pchip');
+y(126) = 1.0; % 大跳变
+y(127:end) = 1.0;
 
-% b. 增加周期性尖峰 (每隔6个样本)
+% 添加周期性尖峰
 spike_period = 6;
-spike_indices = (1:spike_period:N)';
-spikes = zeros(N, 1);
-spikes(spike_indices) = 1.5 * (1 + 0.5*rand(length(spike_indices),1)); % 随机高度的尖峰
+spike_amplitude = 0.5;
+spike_indices = 130:spike_period:N;
+y(spike_indices) = y(spike_indices) + spike_amplitude * (1 + 0.2*randn(size(spike_indices)))';
 
-% c. 合成观测信号
-y = true_trend + spikes + 0.05 * randn(N,1);
-
-% --- 2. 创建掩码以忽略尖峰 ---
+% --- 2. 创建掩码 ---
 mask = true(N, 1);
-% 忽略尖峰本身和它前面的一个点
-indices_to_mask = [spike_indices; spike_indices - 1];
-indices_to_mask = unique(indices_to_mask); % 去重
-indices_to_mask = indices_to_mask(indices_to_mask > 0 & indices_to_mask <= N); % 确保索引有效
-mask(indices_to_mask) = false;
+% 将尖峰及其前一个点标记为“坏点”
+mask(spike_indices) = false;
+mask(spike_indices - 1) = false;
 
-% --- 3. 运行分解算法进行对比 ---
-n = 2; % 趋势是平滑曲线
+% --- 3. 设置分解参数 ---
+n = 2; % 信号主要是平滑曲线
 gamma_trend = 5.0;
+gamma_noise = 1.0;
 rho = 5.0;
+% 我们不需要周期-2分解，所以将其权重设为0
+gamma_periodic = 0;
 
-% a. 不使用掩码 (v3.0 行为)
+% --- 4. 运行分解 ---
+
+% a. 不使用掩码 (传统去噪)
 fprintf('\n--- 运行分解 (不使用掩码) ---\n');
 tic;
-xt_no_mask = admm_decompose_trend_periodic_v3(y, n, gamma_trend, 'gamma_periodic', 0, 'rho', rho);
+[xt_no_mask, ~, ~] = admm_decompose_trend_periodic_v4_1(y, true(N,1), n, gamma_trend, ...
+    'gamma_noise', gamma_noise, 'rho', rho, 'gamma_periodic', gamma_periodic);
 toc;
 
-% b. 使用掩码 (v4.1 行为)
-fprintf('\n--- 运行分解 (使用掩码 v4.1) ---\n');
+% b. 使用掩码 (信号修复)
+fprintf('\n--- 运行分解 (使用掩码) ---\n');
 tic;
-[xt_masked, ~, ~] = admm_decompose_trend_periodic_v4_1(y, n, gamma_trend, 'rho', rho, 'gamma_periodic', 0, 'mask', mask);
+[xt_mask, ~, ~] = admm_decompose_trend_periodic_v4_1(y, mask, n, gamma_trend, ...
+    'gamma_noise', gamma_noise, 'rho', rho, 'gamma_periodic', gamma_periodic);
 toc;
 
-% --- 4. 可视化对比结果 ---
-figure('Name', '掩码功能验证', 'NumberTitle', 'off', 'Position', [100, 100, 1000, 600]);
+% --- 5. 可视化对比 ---
+figure('Name', 'v4.1 Masking 功能验证', 'NumberTitle', 'off', 'Position', [100, 100, 1000, 500]);
 set(gcf, 'color', 'w');
 
-plot(t, y, 'Color', [0.7 0.7 1], 'DisplayName', '观测信号 (带尖峰)');
+% 绘制原始信号和被掩码的点
+plot(t, y, 'o-', 'Color', [0.5 0.5 1], 'DisplayName', '观测信号 y');
 hold on;
-plot(t, true_trend, 'k-', 'LineWidth', 2.5, 'DisplayName', '真实平滑趋势');
+plot(t(~mask), y(~mask), 'rx', 'MarkerSize', 10, 'LineWidth', 2, 'DisplayName', '被忽略的点 (Masked)');
 
-% 绘制不使用掩码的结果
-plot(t, xt_no_mask, 'm--', 'LineWidth', 2, 'DisplayName', '恢复趋势 (无掩码)');
-
-% 绘制使用掩码的结果
-plot(t, xt_masked, 'r-', 'LineWidth', 2, 'DisplayName', '恢复趋势 (带掩码)');
-
-% 标记出被掩码忽略的点
-plot(t(~mask), y(~mask), 'kx', 'MarkerSize', 10, 'LineWidth', 2, 'DisplayName', '被忽略的点');
+% 绘制两种策略的结果
+plot(t, xt_no_mask, 'm--', 'LineWidth', 2, 'DisplayName', '结果 (不使用掩码)');
+plot(t, xt_mask, 'r-', 'LineWidth', 2, 'DisplayName', '结果 (使用掩码)');
 
 legend('show', 'Location', 'best');
-title('使用掩码进行信号修复的效果对比');
+title('使用掩码进行信号修复 vs. 传统去噪');
 grid on;
 xlabel('样本索引');
 ylabel('幅值');
+xlim([95, 195]); % 放大感兴趣的区域
+
+function [x_trend, x_periodic, x_noise] = admm_decompose_trend_periodic_v4_1(y, mask, n, gamma_trend, varargin)
+% ADMM_DECOMPOSE_TREND_PERIODIC - (v4.1 - Masking Support)
+%
+% 支持掩码功能，可忽略“坏点”并进行信号修复。
+%
+% 用法:
+%   [xt, xp, xn] = admm_decompose_trend_periodic_v4_1(y, mask, n, gamma_trend, ...)
+%
+% 输入:
+%   y             - (N x 1) 观测信号
+%   mask          - (N x 1) 布尔或0/1掩码, true/1表示“好点”
+%   n             - (标量) 趋势成分的阶数
+%   gamma_trend   - (标量, >=0) 趋势成分的正则化参数
+%
+% 可选输入 (键值对):
+%   'gamma_noise'    - (标量, >0) 噪声成分的权重。(默认: 1.0)
+%   'gamma_periodic' - (标量, >=0) 周期成分的权重。(默认: 1.0)
+%   'rho'            - (标量, >0) ADMM参数 (默认: 10.0)
+%   'max_iter'       - (整数) 最大迭代次数 (默认: 200)
+%   'tol_abs'        - (标量) 绝对收敛容忍度 (默认: 1e-4)
+%   'tol_rel'        - (标量) 相对收敛容忍度 (默认: 1e-2)
+%   'verbose'        - (逻辑) 是否打印迭代信息 (默认: true)
+%   'use_gmetv'      - (逻辑) (接口保留) 是否使用 GME-TV (默认: false)
+%   'gme_K'          - (整数) (接口保留) GME-TV 参数 K (默认: 10)
+
+% --- 1. 解析输入参数 ---
+p = inputParser;
+addRequired(p, 'y', @isnumeric);
+addRequired(p, 'mask', @isnumeric);
+addRequired(p, 'n', @(x) isscalar(x) && x >= 0);
+addRequired(p, 'gamma_trend', @(x) isscalar(x) && x >= 0);
+addParameter(p, 'gamma_noise', 1.0, @(x) isscalar(x) && x > 0);
+addParameter(p, 'gamma_periodic', 1.0, @(x) isscalar(x) && x >= 0);
+addParameter(p, 'rho', 10.0, @(x) isscalar(x) && x > 0);
+addParameter(p, 'max_iter', 200, @(x) isscalar(x) && x > 0);
+addParameter(p, 'tol_abs', 1e-4, @isnumeric);
+addParameter(p, 'tol_rel', 1e-2, @isnumeric);
+addParameter(p, 'verbose', true, @islogical);
+addParameter(p, 'use_gmetv', false, @islogical); % 接口保留
+addParameter(p, 'gme_K', 10, @(x) isscalar(x) && x > 0); % 接口保留
+parse(p, y, mask, n, gamma_trend, varargin{:});
+
+gamma_noise = p.Results.gamma_noise;
+gamma_periodic = p.Results.gamma_periodic;
+rho = p.Results.rho;
+max_iter = p.Results.max_iter;
+tol_abs = p.Results.tol_abs;
+tol_rel = p.Results.tol_rel;
+verbose = p.Results.verbose;
+use_gmetv = p.Results.use_gmetv;
+gme_K = p.Results.gme_K;
+
+% --- 2. 初始化和预计算 ---
+N = length(y);
+y = y(:);
+mask = logical(mask(:));
+
+if gamma_periodic > 0
+    Ap = spdiags([ones(N-1,1), ones(N-1,1)], [0, 1], N-1, N);
+    L_Ap = chol(Ap * Ap', 'lower'); L_Ap_t = L_Ap';
+else
+    Ap = []; L_Ap = []; L_Ap_t = [];
+end
+
+x_trend = y;
+x_periodic = zeros(N, 1);
+x_noise = zeros(N, 1);
+u = zeros(N, 1);
+
+if verbose
+    fprintf('开始 ADMM 信号分解 (v4.1 - Masking Support)...\n');
+end
+
+% --- 3. ADMM 主循环 ---
+for k = 1:max_iter
+    x_trend_old = x_trend;
+    
+    % a. x_trend 更新
+    v_trend = y - x_periodic - x_noise - u;
+    if use_gmetv
+        % ** GME-TV 接口保留处 **
+        % x_trend = prox_update_trend_gmetv_masked(v_trend, mask, n, gamma_trend, rho, gme_K);
+        warning('GME-TV with masking is not yet implemented. Falling back to L1-TV.');
+        x_trend = prox_update_trend_masked(v_trend, mask, n, gamma_trend, rho);
+    else
+        x_trend = prox_update_trend_masked(v_trend, mask, n, gamma_trend, rho);
+    end
+    
+    % b. x_periodic 更新 (不受掩码直接影响，因其先验不依赖y)
+    v_periodic = y - x_trend - x_noise - u;
+    x_periodic = prox_update_periodic(v_periodic, gamma_periodic, Ap, L_Ap, L_Ap_t);
+    
+    % c. x_noise 更新 (受掩码影响)
+    v_noise = y - x_trend - x_periodic - u;
+    x_noise = prox_update_noise_masked(v_noise, mask, gamma_noise, rho);
+    
+    % d. 对偶变量 u 更新 (核心修改：只在掩码内更新)
+    residual = x_trend + x_periodic + x_noise - y;
+    u(mask) = u(mask) + residual(mask);
+    
+    % e. 检查收敛条件
+    r_prim = norm(residual(mask)); % 只关心好点的残差
+    r_dual = rho * norm(x_trend - x_trend_old);
+    
+    eps_prim = sqrt(sum(mask))*tol_abs + tol_rel*max([norm(x_trend), norm(x_periodic), norm(x_noise), norm(y(mask))]);
+    eps_dual = sqrt(N)*tol_abs + tol_rel*norm(rho*u);
+    
+    if verbose && mod(k, 10) == 0
+        fprintf('Iter %d: Primal Res = %.4f (eps=%.4f), Dual Res = %.4f (eps=%.4f)\n', ...
+            k, r_prim, eps_prim, r_dual, eps_dual);
+    end
+    
+    if r_prim < eps_prim && r_dual < eps_dual
+        if verbose, fprintf('在第 %d 次迭代收敛。\n', k); end
+        break;
+    end
+end
+
+if k == max_iter && verbose, fprintf('达到最大迭代次数 %d。\n', max_iter); end
+
+end
+
+% --- Helper Functions for Proximal Updates (Masked Versions) ---
+
+function z_t = prox_update_trend_masked(v, mask, n, gamma_t, rho)
+    if gamma_t > 0
+        z_t = admm_trend_filter_masked(v, n, gamma_t/rho, mask, 'rho', 1.0, 'max_iter', 20);
+    else
+        z_t = v;
+    end
+end
+
+function z_p = prox_update_periodic(v, gamma_p, Ap, L_Ap, L_Ap_t)
+    % (与v3相同, 不受掩码直接影响)
+    if gamma_p > 0
+        temp = L_Ap_t \ (L_Ap \ (Ap * v));
+        z_p = v - Ap' * temp;
+        z_p = z_p - mean(z_p);
+    else
+        z_p = zeros(size(v));
+    end
+end
+
+function z_n = prox_update_noise_masked(v, mask, gamma_n, rho)
+    % 噪声项的近端更新 (带掩码)
+    z_n = zeros(size(v));
+    % 好点: 缩放
+    z_n(mask) = (rho / (gamma_n + rho)) * v(mask);
+    % 坏点: 直接取 v (因为数据保真项为0, 只有二次项)
+    z_n(~mask) = v(~mask);
+    % 整体零均值
+    z_n = z_n - mean(z_n);
+end
 
 
 function z = admm_trend_filter_masked(z_hat, n, gamma, mask, varargin)
-% ADMM_TREND_FILTER_MASKED - (v4.1 Core) 求解带掩码的n阶L1趋势滤波
+% ADMM_TREND_FILTER_MASKED - 支持掩码的n阶L1趋势滤波求解器
 %
 % 解决以下优化问题:
 %   minimize (1/2)||mask.*(z - z_hat)||_2^2 + gamma * ||D_n z||_1
 %
-% 输入:
-%   z_hat    - (N x 1) 观测信号
-%   n        - (标量) 趋势滤波阶数
-%   gamma    - (标量, >0) 正则化参数
-%   mask     - (N x 1) 布尔或0-1向量，true/1表示已知点
+% 用法:
+%   z = admm_trend_filter_masked(z_hat, n, gamma, mask)
+%   ... = admm_trend_filter_masked(..., 'rho', rho_val, 'max_iter', iter)
 %
-% ... (其他可选参数与 admm_trend_filter 相同)
+% 输入:
+%   z_hat    - (N x 1) 观测信号向量
+%   n        - (标量) 趋势滤波的阶数
+%   gamma    - (标量, >0) 正则化参数
+%   mask     - (N x 1) 布尔或0/1向量, true/1表示“好点”, false/0表示“坏点”
+%
+% 可选输入 (键值对):
+%   'rho'      - (标量, >0) ADMM参数 (默认: 1.0)
+%   'max_iter' - (整数) 最大迭代次数 (默认: 50)
+%   'tol'      - (标量) 收敛容忍度 (默认: 1e-4)
+%
+% 输出:
+%   z        - (N x 1) 滤波/修复后的信号向量
 
 % --- 1. 解析输入参数 ---
 p = inputParser;
@@ -98,143 +264,46 @@ tol_abs = p.Results.tol;
 % --- 2. 初始化和预计算 ---
 N = length(z_hat);
 z_hat = z_hat(:);
-mask = logical(mask(:));
+mask = logical(mask(:)); % 确保是逻辑列向量
 
-% 特例: 如果 n=1 且无缺失数据，使用 Condat 的快速算法
-if n == 1 && all(mask)
-    z = TV_Condat_v2(z_hat, gamma);
-    return;
-end
+% 构建 n 阶差分矩阵 D_n
+D = diff(speye(N), n);
+D = sparse(D);
 
-Dn = sparse(diff(eye(N), n));
+% 初始化 ADMM 变量
+z = z_hat;
 u = zeros(N - n, 1);
 y = zeros(N - n, 1);
-z = z_hat; % 热启动
 
-% **核心性能优化**: 预计算和分解 z-update 的左侧矩阵
-% M'M 对应于对角掩码矩阵
-M_mask = spdiags(double(mask), 0, N, N); 
-LHS = M_mask + rho * (Dn' * Dn);
+% **核心修改**: 构建带掩码的左侧矩阵
+% M'M 对应于一个对角矩阵，对角线元素为 mask
+M_mask = spdiags(double(mask), 0, N, N);
+LHS = M_mask + rho * (D' * D);
+
+% **性能优化**: 预计算 Cholesky 分解
 R = chol(LHS);
 R_t = R';
-
-masked_z_hat = z_hat;
-masked_z_hat(~mask) = 0; % 只保留已知点的数据
 
 % --- 3. ADMM 主循环 ---
 for k = 1:max_iter
     u_old = u;
     
     % a. z-update: 求解带掩码的稀疏线性系统
-    RHS = masked_z_hat + rho * Dn' * (u - y);
+    RHS = M_mask * z_hat + rho * D' * (u - y);
     z = R \ (R_t \ RHS);
     
     % b. u-update: 软阈值
-    Dnz_plus_y = Dn * z + y;
+    Dz_plus_y = D * z + y;
     threshold = gamma / rho;
-    u = max(0, Dnz_plus_y - threshold) - max(0, -Dnz_plus_y - threshold);
+    u = max(0, Dz_plus_y - threshold) - max(0, -Dz_plus_y - threshold);
     
-    % c. y-update
-    y = y + (Dn * z - u);
+    % c. y-update: 更新对偶变量
+    y = y + (D * z - u);
     
-    % d. 检查收敛 (简化版，对于内部求解器足够)
+    % d. 检查收敛 (为简化，内部循环使用简单判据)
     if norm(u - u_old) < tol_abs
         break;
     end
 end
 
-end
-
-
-function [x_trend, x_periodic, x_noise] = admm_decompose_trend_periodic_v4_1(y, n, gamma_trend, varargin)
-% ADMM_DECOMPOSE_TREND_PERIODIC - (v4.1 - Masking Support)
-%
-% 新增 'mask' 参数以忽略不可信的样本点。
-%（暂未支持GME-TV)
-% 新增可选输入:
-%   'mask'      - (N x 1) 布尔向量，true/1表示已知/可信点 (默认: all true)
-
-% --- 1. 解析输入参数 (在v4基础上增加) ---
-p = inputParser;
-% ... (v4的所有参数定义保持不变)
-addParameter(p, 'mask', true(size(y)), @isnumeric); % 新增 mask 参数
-parse(p, y, n, gamma_trend, varargin{:});
-
-% ... (v4的参数获取保持不变)
-mask = logical(p.Results.mask(:));
-
-% --- 2. 初始化和预计算 ---
-N = length(y);
-y = y(:);
-y_masked = y;
-y_masked(~mask) = 0; % 将未知点的数据置零
-
-% ... (v4的周期项预计算等保持不变)
-% ... (v4的ADMM变量初始化保持不变)
-
-if verbose, fprintf('开始 ADMM 信号分解 (v4.1 - Masking Enabled)...\n'); end
-
-% --- 3. ADMM 主循环 ---
-for k = 1:max_iter
-    x_trend_old = x_trend;
-    
-    % a. x_trend 更新
-    v_trend = y_masked - x_periodic - x_noise - u;
-    if use_gmetv
-        % GME-TV 的近端算子也需要支持掩码，这里简化为 L1-TV 演示
-        % 一个完整的 GME-TV 掩码版本需要修改其内部的 TVD 调用
-        x_trend = prox_update_trend_masked(v_trend, n, gamma_trend, rho, mask);
-    else
-        x_trend = prox_update_trend_masked(v_trend, n, gamma_trend, rho, mask);
-    end
-    
-    % b. x_periodic 更新
-    v_periodic = y_masked - x_trend - x_noise - u;
-    x_periodic = prox_update_periodic_masked(v_periodic, gamma_periodic, Ap, L_Ap, L_Ap_t, mask);
-    
-    % c. x_noise 更新
-    v_noise = y_masked - x_trend - x_periodic - u;
-    x_noise = prox_update_noise_masked(v_noise, gamma_noise, rho, mask);
-    
-    % d. 对偶变量 u 更新 (只在已知点上更新)
-    residual = x_trend + x_periodic + x_noise - y_masked;
-    u(mask) = u(mask) + residual(mask);
-    
-    % e. 检查收敛条件
-    r_prim = norm(residual(mask)); % 只关心已知点的残差
-    r_dual = rho * norm(x_trend - x_trend_old);
-    
-    % ... (v3的收敛阈值计算和打印逻辑保持不变)
-end
-% ... (函数末尾部分保持不变)
-end
-
-% --- Helper Functions for Masked Proximal Updates ---
-
-function z_t = prox_update_trend_masked(v, n, gamma_t, rho, mask)
-    if gamma_t > 0
-        % 调用新的带掩码的趋势滤波器
-        z_t = admm_trend_filter_masked(v, n, gamma_t/rho, mask, 'rho', 1.0);
-    else
-        z_t = v;
-    end
-end
-
-function z_p = prox_update_periodic_masked(v, gamma_p, Ap, L_Ap, L_Ap_t, mask)
-    if gamma_p > 0
-        % 投影问题现在是加权的，但对于0-1掩码，近似解仍然有效
-        temp = L_Ap_t \ (L_Ap \ (Ap * v));
-        z_p = v - Ap' * temp;
-        z_p = z_p - mean(z_p); % 保持零均值
-    else
-        z_p = zeros(size(v));
-    end
-end
-
-function z_n = prox_update_noise_masked(v, gamma_n, rho, mask)
-    % 对于已知点，应用缩放；对于未知点，噪声贡献为0
-    z_n = zeros(size(v));
-    scale_factor = rho / (gamma_n + rho);
-    z_n(mask) = scale_factor * v(mask);
-    z_n = z_n - mean(z_n); % 保持零均值
 end
