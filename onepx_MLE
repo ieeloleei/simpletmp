@@ -1,0 +1,332 @@
+%% SPAD Pile-up 参数估计：极速版 (Ultra-Fast)
+% 
+% 核心改进：
+% 1. 去矩阵化：不构建 J 矩阵，直接计算 Hessian 元素，消除内存分配开销。
+% 2. 移除参数校验：消除函数调用开销。
+% 3. 乘法替代除法：预计算常数倒数。
+
+clear; clc; close all;
+
+% --- 1. 生成仿真数据 ---
+fprintf('正在生成仿真数据...\n');
+N = 1000; T = 30;
+zgt = 3.5; agt = 0.8; bgt = 0.002;
+
+pulse_params.mu = 9.5;
+pulse_params.lambda = 123;
+gt = makedist('InverseGaussian','mu',pulse_params.mu,'lambda',pulse_params.lambda);
+g_mode = gt.mu * (sqrt(1 + 9*gt.mu^2 / (4*gt.lambda^2)) - 3*gt.mu / (2*gt.lambda));
+
+[vhist, varr, vlbd] = get1px(agt, zgt, bgt, gt, N, T);
+
+figure;
+    stem(varr,'filled','-b','MarkerSize',7);
+    hold on;
+    stem(vhist,'filled','-rs');
+    plot(0:0.1:30,sum(varr).*pdf(gt,(0:0.1:30)-zgt),'.k','LineWidth',2)
+    legend('理论计数','堆积计数','加权到达率函数')
+z_init = zgt -1 ; a_init = 0.5; b_init = bgt;
+init_guess = [z_init; a_init; b_init];
+bounds = [-5, T+10; 0, 100; 0, 1];
+% --- 3. 结果验证与可视化 ---
+tic
+[est, loss] = solve_pileup_ultra(vhist, N, pulse_params, init_guess, true, bgt, bounds);
+toc
+
+fprintf('\n估计结果验证:\n');
+fprintf('Z: 真值=%.4f, 估计=%.4f\n', zgt, est.z);
+fprintf('A: 真值=%.4f, 估计=%.4f\n', agt, est.a);
+
+figure('Color','w');
+
+subplot(2,1,1);
+stem(vhist, 'filled', 'Color', [0.8,0.2,0.2]); hold on;
+t_axis = (1:T)';
+% 为了画图重新计算一次波形
+dt = t_axis - est.z;
+mask = dt > 1e-6;
+g_val = zeros(T,1);
+xm = dt(mask);
+term_exp = - (pulse_params.lambda .* (xm - pulse_params.mu).^2) ./ (2 * pulse_params.mu^2 .* xm);
+g_val(mask) = exp(0.5 * log(pulse_params.lambda / (2*pi)) - 1.5 * log(xm) + term_exp);
+%plot(t_axis, (est.a * g_val + est.b)*N, 'b-', 'LineWidth', 2);
+xline(zgt + g_mode, 'g--'); xline(est.z + g_mode, 'b:');
+hold on;
+plot(0:0.1:30,sum(varr).*pdf(gt,(0:0.1:30)-zgt),'.k','LineWidth',2)
+legend('观测数据','反演拟合','真值Z','估计Z'); title('极速版反演结果');
+
+subplot(2,1,2);
+plot(loss, 'k.-'); title('收敛曲线'); ylabel('NLL'); xlabel('Iter');
+
+
+% --- 2. 性能对比测试 ---
+fprintf('\n--- 性能基准测试 (运行 1000 次) ---\n');
+n_runs = 1000;
+
+% 准备数据
+% 假设热启动条件
+z_init = zgt -1 ; a_init = 0.5; b_init = bgt;
+init_guess = [z_init; a_init; b_init];
+bounds = [-5, T+10; 0, 100; 0, 1];
+N = 100;
+% A. 极速版 (Ultra)
+for i = 1:n_runs
+    [Mhist(:,i), ~, ~] = get1px(agt, zgt, bgt, gt, N, T);
+end
+tic;
+nest = zeros(3,n_runs);
+for i = 1:n_runs
+    [est_,~] = solve_pileup_ultra(Mhist(:,i), N, pulse_params, init_guess, true, bgt, bounds);
+    nest(:,i) = struct2array(est_);
+end
+
+t_ultra = toc;
+fprintf('极速版 (Ultra) 总耗时: %.4f s | 单次平均: %.4f ms | FPS: %.1f\n', ...
+    t_ultra, (t_ultra/n_runs)*1000, n_runs/t_ultra);
+figure;
+    histogram(nest(1,:),50)
+
+% =========================================================================
+% 极速求解器 (Ultra-Fast Solver)
+% =========================================================================
+function [estimates, loss_history] = solve_pileup_ultra(vhist, N, pulse_params, init_guess, fix_b, b_val, bounds)
+    % SOLVE_PILEUP_ULTRA
+    % 输入参数直接传递 double 类型，无 struct 校验，无 options 解析
+    % init_guess: [z; a; b]
+    % fix_b: boolean
+    % b_val: double
+    % bounds: 3x2 double
+    
+    % --- 1. 预计算与内存分配 ---
+    T = length(vhist);
+    t_axis = (1:T)';
+    
+    % 统计量预计算
+    h_sum = sum(vhist);
+    h0 = N - h_sum;
+    % 反向累积和 (手动展开 flip/cumsum 以减少函数调用? 对于 T=30 内置函数通常够快，但可优化)
+    % S = flip(cumsum(flip(vhist))) - vhist; 
+    % 手动循环计算 S 可能在 JIT 下更快，避免多次内存翻转
+    S = zeros(T, 1);
+    cum_val = 0;
+    for i = T:-1:1
+        cum_val = cum_val + vhist(i);
+        S(i) = cum_val - vhist(i);
+    end
+    
+    % 波形常数预计算
+    mu = pulse_params.mu;
+    lam = pulse_params.lambda;
+    mu_sq_2 = 2 * mu^2;
+    inv_mu_sq_2 = 1 / mu_sq_2;
+    const_log = 0.5 * log(lam / (2*pi));
+    const_deriv = lam * inv_mu_sq_2;
+    mu_sq = mu^2;
+    
+    % 变量解包
+    z = init_guess(1);
+    a = init_guess(2);
+    if fix_b
+        b = b_val;
+    else
+        b = init_guess(3);
+    end
+    
+    % 边界解包
+    lb_z = bounds(1,1); ub_z = bounds(1,2);
+    lb_a = bounds(2,1); ub_a = bounds(2,2);
+    lb_b = bounds(3,1); ub_b = bounds(3,2);
+    
+    % 循环常量
+    max_iter = 20;
+    tol_step_sq = 1e-16; % 比较平方和避免 sqrt
+    mu_damping = 1e-3;
+    
+    % 预分配数组 (避免循环内分配)
+    loss_history = zeros(max_iter, 1);
+    g_val = zeros(T, 1);
+    g_prime = zeros(T, 1);
+    
+    % --- 2. 优化主循环 ---
+    for iter = 1:max_iter
+        % A. 波形计算 (完全内联 + 向量化)
+        dt = t_axis - z;
+        
+        % 逻辑索引比 find 快，但全向量运算配合 mask 乘法可能更快
+        % 这里使用逻辑索引，因为大部分 dt < 0 时无需计算 log/exp
+        mask = dt > 1e-9; 
+        
+        % 重置 g_val (必须，因为 z 变了)
+        g_val(:) = 0;
+        g_prime(:) = 0;
+        
+        if any(mask)
+            xm = dt(mask);
+            inv_xm = 1 ./ xm;
+            xm_sq = xm .* xm;
+            
+            % PDF 计算
+            % term_exp = - (lam * (xm - mu).^2) ./ (2 * mu^2 * xm);
+            % 优化: (xm-mu)^2 / xm = (xm^2 - 2*xm*mu + mu^2)/xm = xm - 2*mu + mu^2/xm
+            % 这样减少乘法次数? 不一定，MATLAB 向量化对幂优化很好。
+            % 保持原样但提取常数
+            term_exp = -const_deriv .* (xm - mu).^2 .* inv_xm; % 乘法代替除法
+            
+            val_m = exp(const_log - 1.5 * log(xm) + term_exp);
+            g_val(mask) = val_m;
+            
+            % 导数计算
+            % term_deriv = -1.5 ./ xm - const_deriv * (1 - mu^2 ./ xm_sq);
+            term_deriv = -1.5 .* inv_xm - const_deriv .* (1 - mu_sq ./ xm_sq);
+            g_prime(mask) = val_m .* term_deriv;
+        end
+        
+        % B. 梯度与 Hessian 元素计算 (去矩阵化核心)
+        lambda = a .* g_val + b;
+        lambda = max(lambda, 1e-10);
+        
+        exp_neg_lbd = exp(-lambda);
+        denom = 1 - exp_neg_lbd;
+        % w = vhist .* exp_neg_lbd ./ denom;
+        % u = w ./ denom;
+        % 合并计算以减少除法
+        inv_denom = 1 ./ denom;
+        w = vhist .* exp_neg_lbd .* inv_denom;
+        u = w .* inv_denom;
+        
+        dL_dlbd = (h0 + S) - w;
+        
+        % Loss 记录 (可选，为了极速可注释掉)
+        loss_history(iter) = sum((h0 + S) .* lambda - vhist .* log(denom));
+        
+        % Jacobian 列向量
+        J_z = -a .* g_prime;
+        J_a = g_val;
+        % J_b = 1 (虚拟)
+        
+        % C. 标量化构建 Hessian 和 Gradient
+        % 避免了 J' * diag(u) * J 的矩阵乘法
+        
+        % 公共项
+        u_Jz = u .* J_z;
+        u_Ja = u .* J_a;
+        
+        % Hessian 元素 (对称矩阵，只算上三角)
+        Hzz = sum(u_Jz .* J_z);
+        Hza = sum(u_Jz .* J_a);
+        Haa = sum(u_Ja .* J_a);
+        
+        % Gradient 元素
+        gz = sum(dL_dlbd .* J_z);
+        ga = sum(dL_dlbd .* J_a);
+        
+        % D. 显式求解 (Cramer's Rule)
+        dz = 0; da = 0; db = 0;
+        
+        if fix_b
+            % 2x2 系统
+            % [Hzz Hza; Hza Haa] * [dz; da] = -[gz; ga]
+            
+            % 阻尼
+            Hzz = Hzz + mu_damping;
+            Haa = Haa + mu_damping;
+            
+            det_H = Hzz * Haa - Hza * Hza;
+            inv_det = 1 / det_H;
+            
+            % 显式逆乘梯度
+            ngz = -gz; nga = -ga;
+            dz = inv_det * (Haa * ngz - Hza * nga);
+            da = inv_det * (-Hza * ngz + Hzz * nga);
+            
+        else
+            % 3x3 系统 (包含 b)
+            % J_b = 1
+            % Hzb = sum(u .* J_z .* 1) = sum(u_Jz)
+            % Hab = sum(u .* J_a .* 1) = sum(u_Ja)
+            % Hbb = sum(u .* 1 .* 1) = sum(u)
+            % gb  = sum(dL_dlbd)
+            
+            Hzb = sum(u_Jz);
+            Hab = sum(u_Ja);
+            Hbb = sum(u);
+            gb  = sum(dL_dlbd);
+            
+            % 阻尼
+            Hzz = Hzz + mu_damping;
+            Haa = Haa + mu_damping;
+            Hbb = Hbb + mu_damping;
+            
+            % 3x3 显式求逆 (伴随矩阵法)
+            % H = [Hzz Hza Hzb; Hza Haa Hab; Hzb Hab Hbb]
+            % 这种展开虽然长，但比 inv(3x3) 快，且无循环
+            
+            % 代数余子式
+            M11 = Haa*Hbb - Hab*Hab;
+            M12 = Hza*Hbb - Hab*Hzb;
+            M13 = Hza*Hab - Haa*Hzb;
+            M22 = Hzz*Hbb - Hzb*Hzb;
+            M23 = Hzz*Hab - Hza*Hzb;
+            M33 = Hzz*Haa - Hza*Hza;
+            
+            det_H = Hzz*M11 - Hza*M12 + Hzb*M13;
+            inv_det = 1 / det_H;
+            
+            ngz = -gz; nga = -ga; ngb = -gb;
+            
+            % delta = H^-1 * (-g)
+            % 利用对称性 H_inv 也对称
+            dz = inv_det * ( M11*ngz - M12*nga + M13*ngb);
+            da = inv_det * (-M12*ngz + M22*nga - M23*ngb);
+            db = inv_det * ( M13*ngz - M23*nga + M33*ngb);
+        end
+        
+        % E. 更新与投影
+        z_new = z + dz;
+        a_new = a + da;
+        
+        % 投影
+        if z_new < lb_z, z_new = lb_z; elseif z_new > ub_z, z_new = ub_z; end
+        if a_new < lb_a, a_new = lb_a; elseif a_new > ub_a, a_new = ub_a; end
+        
+        step_sq = (z_new - z)^2 + (a_new - a)^2;
+        
+        z = z_new;
+        a = a_new;
+        
+        if ~fix_b
+            b_new = b + db;
+            if b_new < lb_b, b_new = lb_b; elseif b_new > ub_b, b_new = ub_b; end
+            step_sq = step_sq + (b_new - b)^2;
+            b = b_new;
+        end
+        
+        if step_sq < tol_step_sq
+            loss_history = loss_history(1:iter);
+            break;
+        end
+    end
+    
+    estimates.z = z;
+    estimates.a = a;
+    estimates.b = b;
+end
+
+% =========================================================================
+% 原始仿真函数 (保持不变)
+% =========================================================================
+function [vhist,varr,vlbd] = get1px(a,z,b,gt,N,T)
+    vec_lbd = a * pdf(gt,(1:T)' - z);
+    vec_lbd(isnan(vec_lbd)) = 0;
+    Marr = random('Poisson',repmat(vec_lbd,1,N)) + random('Poisson',b*ones(T,N));
+    Marr = (Marr >= 1);
+    Mhist = zeros(size(Marr));
+    [maxMarr,maxRowInd] = max(Marr,[],1);
+    valid_events = maxMarr >= 1;
+    Mhist(sub2ind(size(Marr),maxRowInd(valid_events),find(valid_events))) = 1;
+    vhist = sum(Mhist,2);
+    varr = sum(Marr,2);
+    vlbd = vec_lbd;
+end
+
+
